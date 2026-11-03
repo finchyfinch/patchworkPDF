@@ -1,0 +1,198 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Flatpak manifest for Patchwork PDF (Linux).
+#
+# The GNOME runtime provides GTK, WebKitGTK (the pywebview `gtk` backend) and
+# PyGObject, so those do NOT need to be built here.  This manifest adds the app's
+# Python dependencies (pip) and the application source itself.
+#
+# OCR (Tesseract) is OPTIONAL and DISABLED by default — see the big banner in the
+# `modules:` list below.  Bundling it means source-building leptonica + tesseract
+# (+ autoconf-archive), which is the fiddliest part of the build, so bring the app
+# up first and enable OCR deliberately once the rest works.  Without it, the app
+# runs fine and simply reports "OCR unavailable".
+#
+# Build locally (needs flatpak + flatpak-builder + the GNOME SDK):
+#   flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50
+#   flatpak-builder --user --install --force-clean build-dir \
+#       packaging/flatpak/com.patchworkpdf.app.yaml
+#   flatpak run com.patchworkpdf.app
+#
+# See docs/BUILD_AND_DEPLOY_LINUX.md for the full walkthrough.
+# ─────────────────────────────────────────────────────────────────────────────
+
+app-id: com.patchworkpdf.app          # self-hosted bundle → id is not verified
+runtime: org.gnome.Platform
+runtime-version: '50'                 # newest supported GNOME runtime (verified on Flathub, 2026-07).
+sdk: org.gnome.Sdk                    # check newest: flatpak remote-info flathub org.gnome.Platform
+command: patchworkpdf
+
+finish-args:
+  # Display + GPU
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=ipc
+  # Open/save PDFs anywhere the user points the file dialog.
+  - --filesystem=host
+  # Allow driving the HOST's LibreOffice for Word/Excel import via
+  # `flatpak-spawn --host` (optional — remove to disable Office import).
+  - --talk-name=org.freedesktop.Flatpak
+  # The build is self-hosted on SourceForge, so the in-app update checker runs on
+  # Linux too and needs network access to read the SourceForge RSS feed.
+  - --share=network
+
+modules:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # OCR (Leptonica + Tesseract).  A Flatpak sandbox can't see a host `tesseract`,
+  # so it is built in.  tesseract's GitHub archive has no ./configure, so it runs
+  # autogen.sh, which needs the AX_* macros from autoconf-archive — hence three
+  # modules, in this order.  Checksums are verified for the listed versions.
+  # To DISABLE OCR again, comment these three modules back out.
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: autoconf-archive            # build-time only (provides AX_* m4 macros)
+    buildsystem: autotools
+    cleanup: ['*']
+    sources:
+      - type: archive
+        url: https://ftp.gnu.org/gnu/autoconf-archive/autoconf-archive-2023.02.20.tar.xz
+        sha256: 71d4048479ae28f1f5794619c3d72df9c01df49b1c628ef85fde37596dc31a33
+
+  - name: leptonica
+    buildsystem: autotools            # release tarball ships ./configure
+    sources:
+      - type: archive
+        url: https://github.com/DanBloomberg/leptonica/releases/download/1.85.0/leptonica-1.85.0.tar.gz
+        sha256: 3745ae3bf271a6801a2292eead83ac926e3a9bc1bf622e9cd4dd0f3786e17205
+
+  - name: tesseract
+    buildsystem: simple               # archive lacks ./configure → run autogen
+    build-commands:
+      # ACLOCAL_PATH points aclocal/autoreconf at the autoconf-archive macros in
+      # /app so autogen resolves AX_CHECK_COMPILE_FLAG / AX_*_VERSION reliably.
+      - ACLOCAL_PATH=/app/share/aclocal ./autogen.sh
+      - ./configure --prefix=/app --disable-openmp
+      - make -j$(nproc)
+      - make install
+    sources:
+      - type: archive
+        url: https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.0.tar.gz
+        sha256: f2fb34ca035b6d087a42875a35a7a5c4155fa9979c6132365b1e5a28ebc3fc11
+
+  # ── Python dependencies ─────────────────────────────────────────────────────
+  # LOCAL builds: the simplest path is to let pip fetch from PyPI.  This needs
+  # network access during the build, enabled per-module via build-args below.
+  # (Flathub forbids build-time network — see the Linux doc for the vendored
+  # variant, only relevant if you ever publish to the store.)
+  #
+  # --ignore-installed is load-bearing.  pip runs in the SDK, which ships extra
+  # Python packages the Platform runtime does NOT (lxml among them).  Without
+  # the flag pip sees those as "already satisfied", installs nothing into /app,
+  # and the app then fails at run time: up to v3.2 the bundle had no lxml, so
+  # python-docx could not import and Export to Word answered HTTP 500.  With it,
+  # every dependency lands in /app and the bundle no longer depends on what the
+  # SDK happens to carry.
+  - name: python-deps
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      - pip3 install --prefix=/app --no-build-isolation --ignore-installed
+          flask==3.1.3 pywebview==5.4
+          pypdf==6.14.2 pypdfium2==5.10.1 pikepdf==10.9.1
+          Pillow==12.2.0 pytesseract==0.3.13 numpy==2.5.0
+          reportlab==5.0.0 python-docx==1.2.0 openpyxl==3.1.5
+          pdfplumber==0.11.10
+
+  # ── The application ─────────────────────────────────────────────────────────
+  - name: patchworkpdf
+    buildsystem: simple
+    build-commands:
+      # App code + assets → /app/share/patchworkpdf.
+      # The app resolves its own root by climbing three dirs up from
+      # src/backend/entry.py (see get_app_dir() — non-frozen branch), and imports
+      # its backend packages (bootstrap, routes, pdf, …) as top-level modules from
+      # src/backend.  So the dev layout MUST be preserved verbatim: keep src/ intact
+      # and place version.json/LICENSE.txt/assets/locales/docs at the tree root.
+      - install -d /app/share/patchworkpdf
+      - cp -r src version.json LICENSE.txt assets locales docs
+              /app/share/patchworkpdf/
+      # Launcher on PATH
+      - install -Dm755 packaging/flatpak/patchworkpdf /app/bin/patchworkpdf
+      # Desktop integration
+      - install -Dm644 packaging/flatpak/com.patchworkpdf.app.desktop
+              /app/share/applications/com.patchworkpdf.app.desktop
+      # AppStream metainfo. This is what puts a real version number in
+      # `flatpak list` / GNOME Software — without it the version column is EMPTY
+      # for every build, and since the branch is always 'master' there is then no
+      # way to tell 2.15 from 2.18 in flatpak's own tooling. (That is not
+      # hypothetical: it is exactly what made a stale user-scope install
+      # masquerade as the new one on a 22.04 test box.)
+      #
+      # Installing a metainfo.xml makes flatpak-builder generate AppStream
+      # catalogue data at finalization. This needs a builder that calls
+      # `appstreamcli compose`; the OLD apt flatpak-builder on Ubuntu 22.04
+      # (v1.2.2) calls appstream-glib's `appstream-compose`, which the GNOME 50
+      # runtime no longer ships, and the build dies with
+      #   "bwrap: execvp appstream-compose: No such file or directory".
+      # build_flatpak.sh therefore picks the builder for you: it prefers the
+      # Flatpak-packaged org.flatpak.Builder and falls back to a system
+      # flatpak-builder only when it is new enough. If you invoke
+      # flatpak-builder by hand on an old distro, use:
+      #     flatpak install -y flathub org.flatpak.Builder
+      #     flatpak run org.flatpak.Builder --user --force-clean --install \
+      #         build-dir packaging/flatpak/com.patchworkpdf.app.yaml
+      - install -Dm644 packaging/flatpak/com.patchworkpdf.app.metainfo.xml
+              /app/share/metainfo/com.patchworkpdf.app.metainfo.xml
+      # Icons (hicolor)
+      - for s in 16 32 48 64 128 256; do
+          install -Dm644 assets/icon-$s.png
+            /app/share/icons/hicolor/${s}x${s}/apps/com.patchworkpdf.app.png;
+        done
+    sources:
+      - type: dir
+        path: ../..          # repository root, relative to this manifest
+
+  # ── OCR language data (Tesseract .traineddata) ──────────────────────────────
+  # The source-built tesseract above ships no language data, so install it here
+  # into the app's bundled tessdata dir (where ocr_utils._bundled_tessdata_dir()
+  # looks).  ocr_utils requests "<uilang>+eng" from there, pointing tesseract at
+  # this directory with TESSDATA_PREFIX (NOT --tessdata-dir — that has to travel
+  # through pytesseract's config string, which cannot carry a path safely on
+  # Windows; see _apply_tessdata_env).  eng must therefore be present; the others
+  # match the app's UI languages (en/es/fr/de/it) and any missing one degrades to
+  # English.  Tesseract here is 5.x, which wants TESSDATA_PREFIX to be this
+  # directory itself.
+  #
+  # The packs are also in the source tree at assets/tessdata (copied in by the
+  # module above), but this module deliberately re-installs its own downloads:
+  # they are checksum-pinned to the tessdata_fast 4.1.0 tag, so the bundle gets a
+  # known-good set even from a checkout whose packs are missing or stale.  Keep
+  # this list in step with LANGS in tools/fetch_tessdata.py, which pins the same
+  # URLs and checksums for the Windows/macOS builds (a Flatpak build cannot run
+  # that script — network is only allowed for declared sources like these).
+  # Runs after the app module so the target dir already exists.
+  - name: tessdata
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 eng.traineddata /app/share/patchworkpdf/assets/tessdata/eng.traineddata
+      - install -Dm644 spa.traineddata /app/share/patchworkpdf/assets/tessdata/spa.traineddata
+      - install -Dm644 fra.traineddata /app/share/patchworkpdf/assets/tessdata/fra.traineddata
+      - install -Dm644 deu.traineddata /app/share/patchworkpdf/assets/tessdata/deu.traineddata
+      - install -Dm644 ita.traineddata /app/share/patchworkpdf/assets/tessdata/ita.traineddata
+    sources:
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata
+        sha256: 7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/spa.traineddata
+        sha256: 6f2e04d02774a18f01bed44b1111f2cd7f3ba7ac9dc4373cd3f898a40ea6b464
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/fra.traineddata
+        sha256: ced037562e8c80c13122dece28dd477d399af80911a28791a66a63ac1e3445ca
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/deu.traineddata
+        sha256: 19d219bbb6672c869d20a9636c6816a81eb9a71796cb93ebe0cb1530e2cdb22d
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/ita.traineddata
+        sha256: b8f89e1e785118dac4d51ae042c029a64edb5c3ee42ef73027a6d412748d8827

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Launcher for the Flatpak build.  The app is a Flask + pywebview program whose
+# entry point lives at src/backend/entry.py.  Running it directly puts
+# src/backend on sys.path[0] so the backend packages import, and get_app_dir()
+# climbs three dirs up to /app/share/patchworkpdf to resolve assets/frontend.
+# pywebview auto-selects the gtk (WebKitGTK) backend from the GNOME runtime.
+exec python3 /app/share/patchworkpdf/src/backend/entry.py "$@"

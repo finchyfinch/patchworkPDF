@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata — required for Flathub. Validate with:
+     flatpak run org.freedesktop.appstream-glib validate com.patchworkpdf.app.metainfo.xml -->
+<component type="desktop-application">
+  <id>com.patchworkpdf.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>  <!-- set to your actual license id -->
+  <name>Patchwork PDF</name>
+  <summary>Merge, reorder, rotate and edit PDF pages</summary>
+
+  <description>
+    <p>
+      Patchwork PDF is a lightweight PDF editor for merging, reordering,
+      rotating and editing PDF pages. It can import Office documents (via
+      LibreOffice), run OCR on scanned pages, and edit page text.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.patchworkpdf.app.desktop</launchable>
+
+  <categories>
+    <category>Office</category>
+    <category>Publishing</category>
+  </categories>
+
+  <content_rating type="oars-1.1"/>
+
+  <developer id="com.patchworkpdf">
+    <name>Gareth Finch</name>
+  </developer>
+
+  <!-- Screenshots are REQUIRED for Flathub but deliberately omitted for the
+       self-hosted bundle: `appstreamcli compose` fetches every <image> URL to
+       build thumbnails, so the old placeholder URL made the build fetch a host
+       that does not exist. Restore this block, with real URLs, before any
+       Flathub submission:
+  <screenshots>
+    <screenshot type="default">
+      <caption>Editing a PDF in Patchwork PDF</caption>
+      <image>https://REPLACE-WITH-A-REAL-URL/screenshot-main.png</image>
+    </screenshot>
+  </screenshots>
+  -->
+
+  <!-- The NEWEST entry here is what `flatpak list` and GNOME Software report as
+       the installed version. It must match version.json — build_flatpak.sh
+       refuses to build when the two disagree, because a stale entry here means
+       every release reports the same old version and there is then no way to
+       tell two installs apart (branch is always 'master'). -->
+  <releases>
+    <release version="3.3" date="2026-10-25"/>
+    <release version="3.2" date="2026-09-30"/>
+    <release version="2.22" date="2026-08-25"/>
+    <release version="2.21" date="2026-08-23"/>
+    <release version="2.19" date="2026-08-11"/>
+    <release version="2.18" date="2026-08-01"/>
+    <release version="2.15" date="2026-07-12"/>
+    <release version="2.13" date="2026-07-03"/>
+  </releases>
+</component>

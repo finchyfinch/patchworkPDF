@@ -1,0 +1,148 @@
+================================================================================
+                          PATCHWORK PDF USAGE LICENSE
+            Free for Private and Commercial Use - No-Resale - Source-Available
+================================================================================
+
+Copyright (c) 2026 Gareth Finch ("the Author")
+
+This license governs the use of the Patchwork PDF application, including its
+source code, compiled executables, installers, documentation and bundled
+assets (together, "the Software").
+
+By installing, copying, modifying or otherwise using the Software you accept
+the terms of this license. If you do not accept these terms, do not use the
+Software.
+
+
+1. FREE USE
+   You may use the Software free of charge, for any private, educational,
+   non-profit or commercial purpose, on any number of computers.
+
+2. COPYING AND SHARING
+   You may copy and share the Software with others free of charge, provided
+   that each copy includes this license, all copyright notices, and the
+   third-party notices below, all unaltered.
+
+3. MODIFICATION
+   You may modify the Software and create works derived from it for your own
+   use. Modified versions remain subject to this license in full.
+
+4. DEPLOYMENT OF MODIFIED VERSIONS - SOURCE CODE REQUIRED
+   If you deploy or distribute the Software, or any modified version of it,
+   to any person or organisation other than yourself (including deployment
+   inside a company, or distribution to the public), you must:
+     (a) include the complete corresponding source code of the version you
+         are deploying, or make it available to every recipient at no charge;
+     (b) clearly mark any changes you have made as your own, with the date of
+         the change, so they are not attributed to the Author;
+     (c) retain this license, unaltered, so that it applies to the deployed
+         version and to every recipient; and
+     (d) not represent the modified version as the original Software or as
+         endorsed by the Author.
+
+5. NO SALE
+   The Software may NOT be sold, in its original form or in any modified
+   form. You may not charge any fee, payment or other consideration for the
+   Software itself, for a modified version of it, or for access to either -
+   whether as a purchase price, licensing fee, subscription, in-app payment
+   or paid download. You may charge for genuinely separate services (for
+   example your own support or training), but never for the Software itself.
+
+6. THIRD-PARTY COMPONENTS
+   The Software is built on third-party open-source components which remain
+   the property of their respective authors and are licensed to you under
+   their own terms, listed in the THIRD-PARTY NOTICES section below. Nothing
+   in this license restricts the rights those licenses grant you to the
+   components themselves.
+
+7. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT. YOU USE THE
+   SOFTWARE AT YOUR OWN RISK. ALWAYS KEEP BACKUP COPIES OF DOCUMENTS YOU
+   EDIT WITH THE SOFTWARE.
+
+8. LIMITATION OF LIABILITY
+   IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER
+   DEALINGS IN THE SOFTWARE, INCLUDING LOSS OF OR DAMAGE TO DOCUMENTS OR DATA.
+
+9. TERMINATION
+   Your rights under this license end automatically if you breach any of its
+   terms. Rights of others who received the Software from you in compliance
+   with this license are not affected.
+
+
+================================================================================
+                             THIRD-PARTY NOTICES
+================================================================================
+
+Patchwork PDF includes or depends upon the following third-party components.
+Each is used in unmodified form and remains under its own license. Copies of
+these licenses are available from the linked project pages; the font licenses
+are also bundled with the Software in the assets/fonts folder.
+
+Application runtime
+-------------------
+  Python                  PSF License             https://www.python.org
+  Flask                   BSD-3-Clause            https://palletsprojects.com/p/flask
+  Werkzeug                BSD-3-Clause            https://palletsprojects.com/p/werkzeug
+  Jinja2                  BSD-3-Clause            https://palletsprojects.com/p/jinja
+  Click                   BSD-3-Clause            https://palletsprojects.com/p/click
+  ItsDangerous            BSD-3-Clause            https://palletsprojects.com/p/itsdangerous
+  MarkupSafe              BSD-3-Clause            https://palletsprojects.com/p/markupsafe
+  Blinker                 MIT                     https://github.com/pallets-eco/blinker
+  pywebview               BSD-3-Clause            https://github.com/r0x0r/pywebview
+  Python.NET (pythonnet)  MIT                     https://github.com/pythonnet/pythonnet
+
+PDF processing
+--------------
+  pypdf                   BSD-3-Clause            https://github.com/py-pdf/pypdf
+  pypdfium2               BSD-3-Clause/Apache-2.0 https://github.com/pypdfium2-team/pypdfium2
+  PDFium                  BSD-3-Clause            https://pdfium.googlesource.com/pdfium
+  pikepdf                 MPL-2.0                 https://github.com/pikepdf/pikepdf
+  qpdf                    Apache-2.0              https://github.com/qpdf/qpdf
+  ReportLab               BSD-3-Clause            https://www.reportlab.com
+
+  Note on pikepdf: pikepdf is licensed under the Mozilla Public License 2.0
+  and is included unmodified. Its complete source code is available from the
+  project page above, as required by the MPL.
+
+Imaging and OCR
+---------------
+  Pillow                  MIT-CMU                 https://python-pillow.org
+  NumPy                   BSD-3-Clause            https://numpy.org
+  pytesseract             Apache-2.0              https://github.com/madmaze/pytesseract
+  Tesseract OCR engine    Apache-2.0              https://github.com/tesseract-ocr/tesseract
+                          (installed separately by the user; not bundled)
+
+Office document import/export
+-----------------------------
+  python-docx             MIT                     https://github.com/python-openxml/python-docx
+  openpyxl                MIT                     https://openpyxl.readthedocs.io
+  lxml                    BSD-3-Clause            https://lxml.de
+  et_xmlfile              MIT                     https://foss.heptapod.net/openpyxl/et_xmlfile
+  pywin32                 PSF License             https://github.com/mhammond/pywin32
+  docx2pdf                MIT                     https://github.com/AlJohri/docx2pdf
+
+Fonts (bundled in assets/fonts, with their license files)
+---------------------------------------------------------
+  Carlito                 SIL Open Font License 1.1
+  Liberation Sans/Serif/Mono
+                          SIL Open Font License 1.1
+
+System components
+-----------------
+  Microsoft Edge WebView2 Runtime - proprietary Microsoft component, installed
+  and licensed separately under Microsoft's own license terms. The installer
+  includes Microsoft's redistributable WebView2 bootstrapper.
+
+Build tools (not distributed with the application)
+--------------------------------------------------
+  cx_Freeze               PSF-2.0                 https://github.com/marcelotduarte/cx_Freeze
+  Inno Setup              Inno Setup License      https://jrsoftware.org/isinfo.php
+
+================================================================================
+                                 END OF LICENSE
+================================================================================

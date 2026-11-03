@@ -1,0 +1,4 @@
+*.sh text eol=lf
+packaging/flatpak/patchworkpdf text eol=lf
+*.py text eol=lf
+

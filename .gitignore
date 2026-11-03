@@ -1,0 +1,32 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+
+# Build / packaging output
+build/
+dist/
+Output/
+patchworkPDF_source_*/
+
+# Runtime artifacts
+logfile.log
+*.log
+output.txt
+._*
+reopen.pdf
+
+# Tooling / editor
+.idea/
+.vscode/
+.claude/
+
+# NOT ignored on purpose: assets/tessdata/*.traineddata are shipped OCR data
+# (see assets/tessdata/README.md and tools/fetch_tessdata.py).
+
+# OS / office temp files
+Thumbs.db
+.DS_Store
+~$*

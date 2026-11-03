@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Patchwork PDF — requirements.txt
+# Install with:  pip install -r requirements.txt
+#
+# Cross-platform notes:
+#   Windows : the WebView2 (edgechromium) backend needs pythonnet; Office import
+#             via COM needs pywin32 (+ `python Scripts/pywin32_postinstall.py -install`).
+#   macOS   : the cocoa (WKWebView) backend needs the pyobjc WebKit binding.
+#   Linux   : the gtk (WebKitGTK) backend needs PyGObject + WebKit2GTK, which are
+#             provided by the system / the Flatpak GNOME runtime — NOT via pip.
+#             See docs/BUILD_AND_DEPLOY_LINUX.md.
+#
+# The `; sys_platform == ...` markers below let a single `pip install -r` pull
+# only the shell dependencies relevant to the current OS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Web framework
+flask==3.1.3
+
+# Native window wrapper (replaces the OS-browser + watchdog/keep-alive model).
+pywebview==5.4
+
+# Windows WebView2 (edgechromium) bridge to .NET; not used on macOS/Linux.
+pythonnet>=3.0.3 ; sys_platform == "win32"
+
+# macOS WKWebView (cocoa) backend binding.  (pywebview also declares this, but
+# pin it explicitly so the frozen .app reliably includes it.)
+pyobjc-framework-WebKit ; sys_platform == "darwin"
+
+# PDF reading, writing and manipulation
+pypdf==6.14.2
+pypdfium2==5.10.1
+# pikepdf: PDF stream normalisation (strips dual-filter image chains that crash
+# pdfium).  Upstream tags its Intel-macOS wheels macosx_15_0_x86_64 for the whole
+# 10.x line, so pip refuses them on an Intel Mac running macOS 14 or older and
+# falls back to the sdist (needs a full qpdf/C++ toolchain).  9.11.0 is the last
+# release with a macosx_13_0_x86_64 wheel.  Only the code below is affected:
+# pikepdf.Real() is 10.x-only, so src/backend/pdf/form_utils.py passes plain
+# Python numbers instead (works identically on 9.x and 10.x).
+pikepdf==10.9.1 ; sys_platform != "darwin" or platform_machine != "x86_64"
+pikepdf==9.11.0 ; sys_platform == "darwin" and platform_machine == "x86_64"
+
+pdfplumber==0.11.10    # ruled-table detection for Export-to-Excel (pulls in pdfminer.six + cryptography; all pip wheels, no external binaries)
+
+# cryptography arrives transitively via pdfplumber → pdfminer.six.  Release 49.0
+# dropped Intel-macOS wheels altogether (arm64 only), so on any Intel Mac pip
+# falls back to the sdist and needs a Rust toolchain + OpenSSL headers.  48.x
+# still ships a macosx_10_9_universal2 wheel.  Windows/Linux are unconstrained.
+cryptography<49 ; sys_platform == "darwin" and platform_machine == "x86_64"
+
+# Image processing
+Pillow==12.2.0
+
+# OCR support (also requires the Tesseract binary — see the build/deploy docs)
+pytesseract==0.3.13
+numpy==2.5.0
+
+# PDF generation (text/CSV → PDF conversion, compress)
+reportlab==5.0.0
+
+# Office document export (Word, Excel)
+python-docx==1.2.0
+openpyxl==3.1.5
+
+# Office document import — drives installed MS Office via COM (Windows only).
+# Requires Microsoft Office or Microsoft 365 on the machine.  Elsewhere the app
+# falls back to headless LibreOffice (detected at runtime; not a pip dependency).
+pywin32 ; sys_platform == "win32"     # no version pin — install latest, then run pywin32_postinstall.py
+
+# Application freezing
+cx_freeze

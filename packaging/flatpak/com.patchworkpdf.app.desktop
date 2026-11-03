@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Patchwork PDF
+GenericName=PDF Editor
+Comment=Merge, reorder, rotate and edit PDF pages
+Exec=patchworkpdf %f
+Icon=com.patchworkpdf.app
+Terminal=false
+Categories=Office;Publishing;Viewer;
+MimeType=application/pdf;
+StartupNotify=true
+StartupWMClass=Patchwork PDF

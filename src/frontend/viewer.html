@@ -1,0 +1,1792 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<!-- Boot timing: report browser-side bootstrap milestones to the server log.
+     Defined first so it is available to every later script (see boot_timing.py). -->
+<script>
+window.bootMark = function (label) {
+  try {
+    fetch('/api/boot_mark', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: label, t: Math.round(performance.now()) }),
+      keepalive: true,
+    });
+  } catch (e) { /* diagnostics only — never block startup */ }
+};
+bootMark('html head parsed');
+document.addEventListener('DOMContentLoaded', function () { bootMark('DOMContentLoaded'); });
+window.addEventListener('load', function () { bootMark('window load event'); });
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Patchwork PDF</title>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<!-- apiFetch + APP_TOKEN injected here by entry.py -->
+<link rel="stylesheet" href="/viewer.css">
+<style>/* runtime token injection point */</style>
+<!-- Client-side localization: loads the active language dictionary and
+     translates [data-i18n] / [data-i18n-attr] markers on DOMContentLoaded. -->
+<script src="/i18n.js"></script>
+</head>
+<body>
+
+<!-- ── Custom window titlebar (native app only; hidden in a plain browser) ── -->
+<!-- Layout: [document tabs] [+ new] [draggable spacer] [min][max][close].
+     The spacer (.tb-drag) is the only draggable region.  Dragging is driven by
+     shared.js (pointer events → native move_window_to_cursor), NOT pywebview's
+     own .pywebview-drag-region — that one just slides a maximised window instead
+     of un-maximising it. -->
+<div id="app-titlebar">
+  <div id="tb-tabs"></div>
+  <button class="tb-btn" id="tb-newtab" title="New document" aria-label="New document" data-i18n-attr="title:app.titlebar.new_document;aria-label:app.titlebar.new_document">
+    <svg viewBox="0 0 12 12" width="12" height="12"><path d="M6 2.5v7M2.5 6h7" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linecap="round"/></svg>
+  </button>
+  <div class="tb-drag"></div>
+  <div class="tb-controls">
+    <button class="tb-btn" id="tb-min" title="Minimise" aria-label="Minimise" data-i18n-attr="title:app.titlebar.minimise;aria-label:app.titlebar.minimise">
+      <svg viewBox="0 0 12 12" width="11" height="11"><rect x="2" y="5.5" width="8" height="1" fill="currentColor"/></svg>
+    </button>
+    <button class="tb-btn" id="tb-max" title="Maximise" aria-label="Maximise" data-i18n-attr="title:app.titlebar.maximise;aria-label:app.titlebar.maximise">
+      <svg viewBox="0 0 12 12" width="11" height="11"><rect x="2.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+    </button>
+    <button class="tb-btn tb-close" id="tb-close" title="Close" aria-label="Close" data-i18n-attr="title:app.titlebar.close;aria-label:app.titlebar.close">
+      <svg viewBox="0 0 12 12" width="11" height="11"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1" fill="none"/></svg>
+    </button>
+  </div>
+</div>
+
+<!-- ── Shared: confirm overlay ── -->
+<div id="custom-confirm-overlay"
+  onclick="if(event.target===this)dismissConfirm(false)"
+  style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10001;align-items:center;justify-content:center;pointer-events:none">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px 28px 20px;max-width:380px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5);pointer-events:all">
+    <div id="custom-confirm-title" style="font-size:15px;font-weight:600;margin-bottom:10px;color:var(--text)"></div>
+    <div id="custom-confirm-msg"   style="font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:22px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost"  onclick="dismissConfirm(false)" data-i18n="confirm.cancel">Cancel</button>
+      <button class="btn btn-danger" id="custom-confirm-ok" onclick="dismissConfirm(true)" data-i18n="confirm.ok">OK</button>
+    </div>
+  </div>
+</div>
+
+
+<!-- Crash-recovery prompt: shown on launch when unsaved editor drafts are found -->
+<div id="recovery-overlay"
+  style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10002;align-items:center;justify-content:center;pointer-events:none">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px 24px 18px;max-width:460px;width:92%;box-shadow:0 24px 64px rgba(0,0,0,.5);pointer-events:all">
+    <div style="font-size:15px;font-weight:600;margin-bottom:8px;color:var(--text)" data-i18n="recovery_overlay.recover_unsaved_changes">Recover unsaved changes</div>
+    <div style="font-size:13px;color:var(--text-dim);line-height:1.6;margin-bottom:14px" data-i18n="recovery_overlay.patchwork_found_unsaved">
+      Patchwork found unsaved changes from the last time it closed.
+    </div>
+    <div id="recovery-list" style="max-height:280px;overflow-y:auto;margin-bottom:18px;display:flex;flex-direction:column;gap:8px"></div>
+  <!-- (see #whats-new-modal below for the run-once "what's new" note) -->
+    <div style="display:flex;gap:8px;justify-content:space-between;align-items:center">
+      <button class="btn btn-danger" onclick="recoveryDiscardAll()" data-i18n="recovery_overlay.discard_all">Discard all</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-ghost"  onclick="recoveryDismiss()" data-i18n="recovery_overlay.not_now">Not now</button>
+        <button class="btn btn-accent" onclick="recoveryRestoreAll()" data-i18n="recovery_overlay.restore_all">Restore all</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- ═══════════════════════════════════════════════════════
+     VIEWER PANEL
+════════════════════════════════════════════════════════ -->
+<div id="panel-viewer" class="app-panel" style="display:flex">
+<header>
+  <div class="header-left">
+    <div class="logo-small">Patchwork<span>PDF</span> &mdash; <span data-i18n="viewer.header.role">Viewer</span></div>
+  </div>
+  <div class="header-right">
+    <button class="btn btn-ghost" onclick="viewerSaveToFile()" title="Save PDF" data-i18n="viewer.header.save" data-i18n-attr="title:viewer.header.save_tip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+      Save
+    </button>
+    <button class="btn btn-ghost" onclick="showDocProperties()" title="Document properties" data-i18n="viewer.header.properties" data-i18n-attr="title:viewer.header.properties_tip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+      Properties
+    </button>
+    <button class="btn btn-ghost" id="v-btn-layout" onclick="goLayout()" title="Manage pages in layout" data-i18n="viewer.header.layout" data-i18n-attr="title:viewer.header.layout_tip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+      Layout
+    </button>
+    <button class="btn btn-ghost btn-icon" onclick="toggleTheme()" title="Toggle light / dark theme" aria-label="Toggle light or dark theme" data-i18n-attr="title:viewer.header.theme_tip;aria-label:viewer.header.theme_aria">
+      <svg class="theme-icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="theme-icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="4.2" y1="4.2" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.8" y2="19.8"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.2" y1="19.8" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.8" y2="4.2"/></svg>
+    </button>
+    <button class="btn btn-ghost btn-icon" onclick="openShortcutsOverlay()" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" data-i18n-attr="title:viewer.header.shortcuts_tip;aria-label:viewer.header.shortcuts_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/></svg>
+    </button>
+    <button class="btn btn-ghost" onclick="showAbout()" title="About Patchwork PDF" data-i18n="viewer.header.about" data-i18n-attr="title:viewer.header.about_tip">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      About
+    </button>
+    <!-- Language selector (Phase 1 pilot). Endonyms are intentionally not translated. -->
+    <select class="btn btn-ghost" id="lang-select-viewer" data-lang-select
+            onchange="I18N.setLang(this.value)"
+            title="Language" aria-label="Language"
+            data-i18n-attr="title:viewer.header.language_tip;aria-label:viewer.header.language_tip">
+      <option value="en">English</option>
+      <option value="es">Español</option>
+      <option value="fr">Français</option>
+      <option value="de">Deutsch</option>
+      <option value="it">Italiano</option>
+    </select>
+  </div>
+</header>
+
+<!-- Tab bar — shown only when multiple files are open simultaneously -->
+<div id="tab-bar"></div>
+
+<div id="toolbar">
+  <!-- File menu -->
+  <button id="file-menu-btn" class="btn btn-ghost" onclick="toggleFileMenu(event, 'file-menu-btn')"
+          aria-haspopup="true" aria-expanded="false" title="File menu" data-i18n="file_menu_btn.file" data-i18n-attr="title:file_menu_btn.file_menu_tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    File
+    <svg class="fm-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="tool-sep"></div>
+
+  <!-- Page navigation -->
+  <span class="tool-label" data-i18n="toolbar.page">Page</span>
+  <button class="btn btn-ghost btn-icon" onclick="prevPage()" title="Previous page (↑)" aria-label="Previous page" data-i18n-attr="title:toolbar.previous_page_tip;aria-label:toolbar.previous_page_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+  </button>
+  <span id="page-nav-label" ondblclick="editPageNumber()" title="Double-click to jump to a page" data-i18n-attr="title:page_nav_label.double_click_to_jump_tip">— / —</span>
+  <button class="btn btn-ghost btn-icon" onclick="nextPage()" title="Next page (↓)" aria-label="Next page" data-i18n-attr="title:toolbar.next_page_tip;aria-label:toolbar.next_page_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Annotation undo / redo -->
+  <button id="v-btn-undo" class="btn btn-ghost" onclick="viewerUndo()" title="Nothing to undo" disabled data-i18n="v_btn_undo.undo" data-i18n-attr="title:v_btn_undo.nothing_to_undo_tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>
+    Undo
+  </button>
+  <button id="v-btn-redo" class="btn btn-ghost" onclick="viewerRedo()" title="Nothing to redo" disabled data-i18n="v_btn_redo.redo" data-i18n-attr="title:v_btn_redo.nothing_to_redo_tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 7v6h-6"/><path d="M3 17a9 9 0 0 1 9-9 9 9 0 0 1 6 2.3L21 13"/></svg>
+    Redo
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Search -->
+  <span class="tool-label" data-i18n="toolbar.search">Search</span>
+  <input id="search-input" class="tb-input" type="text" placeholder="Find in document…"
+         title="Find in document (Ctrl+F)"
+         oninput="onSearchInput()" onkeydown="onSearchKey(event)" data-i18n-attr="placeholder:search_input.find_in_document_ph;title:search_input.find_in_document_ctrl_tip">
+  <button class="btn btn-ghost btn-icon" onclick="searchPrev()" title="Previous match (Shift+Enter)" aria-label="Previous search match" data-i18n-attr="title:toolbar.previous_match_shift_enter_tip;aria-label:toolbar.previous_search_match_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="18 15 12 9 6 15"/></svg>
+  </button>
+  <button class="btn btn-ghost btn-icon" onclick="searchNext()" title="Next match (Enter)" aria-label="Next search match" data-i18n-attr="title:toolbar.next_match_enter_tip;aria-label:toolbar.next_search_match_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <span id="search-info"></span>
+  <button class="btn btn-ghost btn-icon" id="clear-search-btn" onclick="clearSearch()"
+          style="display:none" title="Clear search" aria-label="Clear search" data-i18n-attr="title:clear_search_btn.clear_search_tip;aria-label:clear_search_btn.clear_search_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+  </button>
+
+  <!-- Spacer (zoom moved to the floating pill over the canvas) -->
+  <div style="flex:1"></div>
+
+  <!-- Read-only badge — shown when the document's own permissions forbid editing.
+       Click to enter the owner password and unlock. -->
+  <button id="restricted-badge" class="ro-badge" style="display:none"
+          onclick="unlockRestricted()"
+          title="This document is password protected and cannot be edited. Click to enter the password."
+          data-i18n-attr="title:restricted_badge.read_only_tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="13" height="13">
+      <rect x="3" y="11" width="18" height="11" rx="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>
+    <span data-i18n="restricted_badge.read_only">Read-only</span>
+  </button>
+
+  <!-- New blank document -->
+  <button class="btn btn-ghost btn-icon" onclick="newDocument()" title="New document (blank A4, opens in a new tab)" aria-label="New document" data-i18n-attr="title:toolbar.new_document_blank_a4_tip;aria-label:toolbar.new_document_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="12" x2="12" y2="18"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+  </button>
+
+  <!-- Password protect -->
+  <button class="btn btn-ghost btn-icon" id="lock-btn" onclick="showPasswordProtectModal()"
+          title="Password protect…" aria-label="Password protect" data-i18n-attr="title:lock_btn.password_protect_tip;aria-label:lock_btn.password_protect_aria">
+    <!-- open padlock — shown when not protected -->
+    <svg id="lock-icon-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+      <rect x="3" y="11" width="18" height="11" rx="2"/>
+      <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+    </svg>
+    <!-- closed padlock — shown when protected (hidden by default) -->
+    <svg id="lock-icon-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="display:none">
+      <rect x="3" y="11" width="18" height="11" rx="2"/>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    </svg>
+  </button>
+
+  <!-- Print -->
+  <button class="btn btn-ghost btn-icon" onclick="printDocument()" title="Print document (Ctrl+P)" aria-label="Print document" data-i18n-attr="title:toolbar.print_document_ctrl_p_tip;aria-label:toolbar.print_document_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+  </button>
+</div>
+
+<div id="main">
+
+  <!-- Left panel: page thumbnails -->
+  <div id="left-panel">
+    <div id="lp-header">
+      <span class="lp-title" id="lp-title-text" data-i18n="lp_title_text.pages">Pages</span>
+      <div class="lp-header-btns">
+        <button id="lp-auto-bookmark" class="lp-iconbtn" onclick="autoBookmarks()"
+                title="Auto-detect bookmarks from a contents page or headings" aria-label="Auto-detect bookmarks" style="display:none" data-i18n-attr="title:lp_auto_bookmark.auto_detect_bookmarks_from_tip;aria-label:lp_auto_bookmark.auto_detect_bookmarks_aria">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M5 3v4M3 5h4M6 17v4m-2-2h4"/><path d="M13 3l3.5 8.5L21 13l-4.5 1.5L13 23l-3.5-8.5L5 13l4.5-1.5z"/></svg>
+        </button>
+        <button id="lp-add-bookmark" class="lp-iconbtn" onclick="addBookmarkCurrentPage()"
+                title="Add bookmark on current page" aria-label="Add bookmark on current page" style="display:none" data-i18n-attr="title:lp_add_bookmark.add_bookmark_on_current_tip;aria-label:lp_add_bookmark.add_bookmark_on_current_aria">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h7"/><line x1="17" y1="3" x2="17" y2="9"/><line x1="14" y1="6" x2="20" y2="6"/></svg>
+        </button>
+        <button id="lp-mode-toggle" class="lp-iconbtn" onclick="toggleLeftMode()"
+                title="Show bookmarks" aria-label="Toggle bookmarks and pages" data-i18n-attr="title:lp_mode_toggle.show_bookmarks_tip;aria-label:lp_mode_toggle.toggle_bookmarks_and_pages_aria">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+        </button>
+        <button id="lp-toggle" onclick="toggleLeftPanel()" title="Collapse panel" aria-label="Collapse pages panel" data-i18n-attr="title:lp_toggle.collapse_panel_tip;aria-label:lp_toggle.collapse_pages_panel_aria">
+          <svg id="lp-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="14" height="14"><polyline points="15 18 9 12 15 6"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="thumb-list"></div>
+    <div id="bookmark-list" style="display:none"></div>
+  </div>
+
+  <!-- Drag handle to resize the left panel horizontally -->
+  <div id="left-resize" onmousedown="startLeftResize(event)"
+       title="Drag to resize panel" data-i18n-attr="title:left_resize.drag_to_resize_panel_tip"></div>
+
+  <!-- Centre: page canvas + highlight overlay -->
+  <div id="canvas-area"
+       ondragover="viewerDragOver(event)" ondragleave="viewerDragLeave(event)"
+       ondrop="viewerDrop(event)">
+    <div id="canvas-column"></div>
+    <!-- Empty state shown when no document is loaded -->
+    <div id="viewer-empty-state" class="show">
+      <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1" stroke-linecap="round" opacity="0.4">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="12" y1="13" x2="12" y2="17"/>
+        <line x1="9" y1="15" x2="15" y2="15"/>
+      </svg>
+      <div style="font-size:15px;font-weight:600;opacity:0.6" data-i18n="viewer_empty_state.drop_a_pdf_here">Drop a PDF here to open it</div>
+      <div style="font-size:12px;opacity:0.4"><span data-i18n="viewer_empty_state.or_click">or click</span> <strong data-i18n="viewer_empty_state.layout">Layout</strong> <span data-i18n="viewer_empty_state.to_manage">to manage &amp; add pages</span></div>
+      <!-- Recent files — populated by _loadRecentFiles(); clickable even though
+           the empty state itself ignores pointer events -->
+      <div id="recent-files" style="display:none">
+        <div id="recent-files-title" data-i18n="recent_files_title.recent_files">Recent files</div>
+        <div id="recent-files-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right panel: tools and comments (collapsed by default) -->
+  <div id="right-panel" class="collapsed">
+    <!-- Tab strip (visible when collapsed) -->
+    <div id="rp-tab" onclick="toggleRightPanel()" title="Show tools and comments" role="button" aria-label="Show tools and comments panel" data-i18n-attr="title:rp_tab.show_tools_tip;aria-label:rp_tab.show_tools_panel_aria">
+      <svg class="rp-tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span class="rp-tab-label" data-i18n="rp_tab.tools">Tools</span>
+      <span id="rp-badge"></span>
+    </div>
+    <!-- Expanded inner content -->
+    <div id="rp-inner">
+      <div id="rp-header">
+        <div id="rp-seg" role="group" aria-label="Panel view" data-i18n-attr="aria-label:rp_seg.panel_view_aria">
+          <button id="rp-seg-comment" class="rp-seg-btn active" onclick="setRightMode('comment')" title="Comment and mark up — sits on top of the page, listed below the tools" data-i18n="rp_seg.comment" data-i18n-attr="title:rp_seg.comment_tip">Comment</button>
+          <button id="rp-seg-edit" class="rp-seg-btn" onclick="setRightMode('edit')" title="Edit — change the document itself" data-i18n="rp_seg.edit" data-i18n-attr="title:rp_seg.edit_tip">Edit</button>
+          <button id="rp-seg-sign" class="rp-seg-btn" onclick="setRightMode('sign')" title="Fill &amp; Sign — form fields and signatures" data-i18n="rp_seg.sign" data-i18n-attr="title:rp_seg.sign_tip">Fill &amp; Sign</button>
+        </div>
+        <button id="rp-toggle" onclick="toggleRightPanel()" title="Collapse panel" aria-label="Collapse tools panel" data-i18n-attr="title:rp_toggle.collapse_panel_tip;aria-label:rp_toggle.collapse_tools_panel_aria">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="14" height="14"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+      </div>
+
+      <!-- Everything below the header scrolls as one: the tools of the tab in
+           view, the settings of the armed tool, and — on the Comment tab — the
+           list of comments in the document. -->
+      <div id="rp-body">
+      <!-- ── Tools (docked).  Three tabs, split by what a tool does to the
+           document — the one thing a new user cannot see from its icon:
+             Comment      an object on top of the page, listed below, removable
+             Edit         changes the document itself (Undo until you save)
+             Fill & Sign  form fields and signatures
+           setRightMode / _tabForTool in viewer-panel.js decide what shows. -->
+      <div id="annot-tools">
+        <div class="rp-group" id="rp-group-comment">
+          <div class="at-section-note" data-i18n="rp_group.comment_note">Sits on top of the page and is listed below. Remove it at any time.</div>
+          <!-- Stamped as the author of everything added here, replies and
+               status changes included.  Persisted by /api/reviewer_name. -->
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="rp_group.your_name">Name</span>
+            <input class="at-inp" id="at-author-name" type="text" maxlength="100" autocomplete="name"
+                   placeholder="Your name — shown on what you add" data-i18n-attr="placeholder:rp_group.your_name_ph;title:rp_group.your_name_tip"
+                   title="Shown as the author of every comment, reply and status you add">
+          </div>
+          <div class="at-tool-row" role="group" aria-label="Comment tools" data-i18n-attr="aria-label:rp_group.comment_tools_aria">
+            <button class="at-tool" id="at-tool-sticky" title="Sticky note (click to place)" onclick="selectAnnotTool('sticky')" data-i18n-attr="title:at_tool_sticky.sticky_note_click_to_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M15 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10l6-6V5a2 2 0 0 0-2-2z"/><path d="M15 21v-5a1 1 0 0 1 1-1h5"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_sticky.sticky">Sticky</span>
+            </button>
+            <button class="at-tool" id="at-tool-text" title="Text — a text box laid on top of the page. It can be moved or deleted, and is listed under Comments." onclick="selectAnnotTool('text')" data-i18n-attr="title:at_tool_text.text_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_text.text">Text</span>
+            </button>
+            <button class="at-tool" id="at-tool-highlight" title="Highlight" onclick="selectAnnotTool('highlight')" data-i18n-attr="title:at_tool_highlight.highlight_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M9 11l-4 4v3h3l4-4"/><path d="M12 8l4 4"/><path d="M14 6l4 4 2-2a2.8 2.8 0 0 0-4-4z"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_highlight.highlight">Highlight</span>
+            </button>
+            <button class="at-tool" id="at-tool-cloud" title="Revision cloud" onclick="selectAnnotTool('cloud')" data-i18n-attr="title:at_tool_cloud.revision_cloud_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M6.5 18.5a3.5 3.5 0 0 1-.4-6.98 4.5 4.5 0 0 1 8.7-1.6 3.5 3.5 0 0 1 .9 6.9 2.6 2.6 0 0 1-.5.05H7a2.9 2.9 0 0 1-.5-.02z"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_cloud.cloud">Cloud</span>
+            </button>
+            <button class="at-tool" id="at-tool-rect" title="Rectangle" onclick="selectAnnotTool('rect')" data-i18n-attr="title:at_tool_rect.rectangle_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><rect x="3.5" y="5.5" width="17" height="13" rx="1.5"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_rect.rectangle">Rectangle</span>
+            </button>
+            <button class="at-tool" id="at-tool-ellipse" title="Ellipse / Circle" onclick="selectAnnotTool('ellipse')" data-i18n-attr="title:at_tool_ellipse.ellipse_circle_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><ellipse cx="12" cy="12" rx="9" ry="6.5"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_ellipse.ellipse">Ellipse</span>
+            </button>
+            <button class="at-tool" id="at-tool-line" title="Line" onclick="selectAnnotTool('line')" data-i18n-attr="title:at_tool_line.line_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_line.line">Line</span>
+            </button>
+            <button class="at-tool" id="at-tool-arrow" title="Arrow line" onclick="selectAnnotTool('arrow')" data-i18n-attr="title:at_tool_arrow.arrow_line_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="10 5 19 5 19 14"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_arrow.arrow">Arrow</span>
+            </button>
+            <button class="at-tool" id="at-tool-darrow" title="Double-ended arrow line" onclick="selectAnnotTool('darrow')" data-i18n-attr="title:at_tool_darrow.double_arrow_line_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="10 5 19 5 19 14"/><polyline points="14 19 5 19 5 10"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_darrow.dbl_arrow">Dbl Arrow</span>
+            </button>
+          </div>
+        </div>
+        <div class="rp-group" id="rp-group-edit" style="display:none">
+          <div class="at-section-note at-section-note-warn" data-i18n="rp_group.edit_note">Changes the document itself. Undo works until you save.</div>
+          <div class="at-tool-row" role="group" aria-label="Edit tools" data-i18n-attr="aria-label:rp_group.edit_tools_aria">
+            <button class="at-tool" id="at-tool-edittext" title="Edit text — click any of the document's own text to change, move or delete it" onclick="selectAnnotTool('edittext')" data-i18n-attr="title:at_tool_edittext.edit_text_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M5 3l14 9-7 1-3 7z"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_edittext.edit_text">Edit text</span>
+            </button>
+            <button class="at-tool" id="at-tool-pagetext" title="Add text — click to type a line, or drag a box for a paragraph. The text becomes part of the page." onclick="selectAnnotTool('pagetext')" data-i18n-attr="title:at_tool_pagetext.add_text_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M3 7V4h12v3"/><path d="M9 4v16"/><path d="M6 20h6"/><path d="M19 13v6"/><path d="M16 16h6"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_pagetext.add_text">Add text</span>
+            </button>
+            <button class="at-tool" id="at-tool-image" title="Insert image (pick a file, then drag on the page)" onclick="selectAnnotTool('image')" data-i18n-attr="title:at_tool_image.insert_image_pick_a_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_image.image">Image</span>
+            </button>
+            <button class="at-tool" id="at-tool-redact" title="Redaction — drag to permanently remove content. This cannot be undone once saved." onclick="selectAnnotTool('redact')" data-i18n-attr="title:at_tool_redact.redaction_drag_permanent_tip">
+              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" width="18" height="18"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+              <span class="at-tool-lbl" data-i18n="tool_redact.redact">Redact</span>
+            </button>
+            <button class="at-tool" id="at-tool-watermark" title="Watermark — stamp text across the page you are viewing" onclick="selectAnnotTool('watermark')" data-i18n-attr="title:at_tool_watermark.watermark_stamp_viewing_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+              <span class="at-tool-lbl" data-i18n="tool_watermark.watermark">Watermark</span>
+            </button>
+            <button class="at-tool" id="at-tool-crop" title="Crop page — drag to mark the area to keep" onclick="selectAnnotTool('crop')" data-i18n-attr="title:tool_crop.crop_page_drag_to_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>
+              <span class="at-tool-lbl" data-i18n="tool_crop.crop">Crop</span>
+            </button>
+          </div>
+        </div>
+        <div class="rp-group" id="rp-group-sign" style="display:none">
+          <div class="at-section-note" data-i18n="rp_group.sign_note">Add form fields for others to fill in, or sign the document.</div>
+          <div class="at-tool-row" role="group" aria-label="Fill and sign tools" data-i18n-attr="aria-label:rp_group.sign_tools_aria">
+            <button class="at-tool" id="at-tool-formfield" title="Form field — choose a type, then drag on the page to place" onclick="selectAnnotTool('formfield')" data-i18n-attr="title:tool_formfield.form_field_choose_a_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+              <span class="at-tool-lbl" data-i18n="tool_formfield.field">Field</span>
+            </button>
+            <button class="at-tool" id="at-tool-signature" title="Signature (type a name, then click to place)" onclick="selectAnnotTool('signature')" data-i18n-attr="title:at_tool_signature.signature_type_a_name_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M3 17c3-3 5-6 5-9a4 4 0 0 0-8 0"/><line x1="10" y1="17" x2="22" y2="17"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_signature.sign">Sign</span>
+            </button>
+          </div>
+        </div>
+        <input type="file" id="at-image-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none">
+
+        <!-- Edit text (the Pointer).  Only reachable with this panel OPEN and
+             the tool armed — a click on the page must never start rewriting the
+             document unless the user asked for it. -->
+        <div id="at-edittext-props" style="display:none">
+          <div class="at-note" data-i18n="at_edittext_props.hint">
+            Click any of the document's own text to select it. Double-click or Enter to change the words, drag to move, Del to remove. Right-click for Row / area to edit several words or lines as one paragraph.
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_edittext_props.selected">Selected</span>
+            <span id="at-et-selected" class="at-et-sel"></span>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_tools.text">Text</span>
+            <label class="at-field" title="Text size" data-i18n-attr="title:ed_tools.text_size_tip">
+              <span class="at-field-lbl" data-i18n="ed_tools.size">Size</span>
+              <input class="at-num" id="at-et-size" type="number" min="4" max="96" placeholder="—">
+            </label>
+            <label class="at-field at-field-color" title="Text colour" data-i18n-attr="title:ed_tools.text_colour_tip">
+              <span class="at-field-lbl" data-i18n="ed_tools.colour">Colour</span>
+              <input class="at-color" id="at-et-color" type="color" value="#000000">
+            </label>
+          </div>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-ghost" style="flex:1;font-size:12px;justify-content:center" onclick="editTextRestyleSelected()" data-i18n="at_edittext_props.restyle">Apply style</button>
+            <button class="btn btn-ghost" id="at-et-delete" style="flex:1;font-size:12px;justify-content:center" onclick="editTextDeleteSelected()" disabled data-i18n="at_edittext_props.delete">Delete</button>
+          </div>
+          <button class="btn btn-ghost" id="at-et-block" style="width:100%;font-size:12px;justify-content:center;margin-top:6px" onclick="editTextBlockSelected()" disabled title="Edit the selected word's row — then drag the box to take in more words or lines — as one paragraph" data-i18n="at_edittext_props.block" data-i18n-attr="title:at_edittext_props.block_tip">Row / area</button>
+        </div>
+
+        <!-- Page-text style (shown while either page-text tool is armed).
+             Its own controls rather than the annotation Text tool's: that one
+             styles an overlay object, these style content written into the
+             page, and sharing them would make the distinction invisible. -->
+        <div id="at-pagetext-props" style="display:none">
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="annot_tools.font">Font</span>
+            <select class="at-sel" id="at-pt-font" title="Text font" data-i18n-attr="title:ml_font.text_font_tip">
+              <optgroup label="Document fonts (embedded)">
+                <option value="Calibri" data-i18n="ml_font.calibri">Calibri</option>
+                <option value="Calibri-Bold" data-i18n="ml_font.calibri_bold">Calibri Bold</option>
+                <option value="Arial" data-i18n="ml_font.arial">Arial</option>
+                <option value="Arial-Bold" data-i18n="ml_font.arial_bold">Arial Bold</option>
+                <option value="TimesNR" data-i18n="ml_font.times_new_roman">Times New Roman</option>
+                <option value="CourierNew" data-i18n="ml_font.courier_new">Courier New</option>
+              </optgroup>
+              <optgroup label="Standard (PDF base-14)">
+                <option value="Helvetica" data-i18n="ml_font.helvetica">Helvetica</option>
+                <option value="Helvetica-Bold" data-i18n="ml_font.helvetica_bold">Helvetica Bold</option>
+                <option value="Times-Roman" data-i18n="ml_font.times_roman">Times Roman</option>
+                <option value="Courier" data-i18n="ml_font.courier">Courier</option>
+              </optgroup>
+            </select>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_tools.text">Text</span>
+            <label class="at-field" title="Text size" data-i18n-attr="title:ed_tools.text_size_tip">
+              <span class="at-field-lbl" data-i18n="ed_tools.size">Size</span>
+              <input class="at-num" id="at-pt-size" type="number" value="12" min="4" max="96">
+            </label>
+            <label class="at-field at-field-color" title="Text colour" data-i18n-attr="title:ed_tools.text_colour_tip">
+              <span class="at-field-lbl" data-i18n="ed_tools.colour">Colour</span>
+              <input class="at-color" id="at-pt-color" type="color" value="#000000">
+            </label>
+          </div>
+          <div class="at-note at-note-warn" data-i18n="at_pagetext_props.permanent_note">
+            Becomes part of the page, not a note on top of it — it cannot be selected or deleted afterwards. Undo works until you save.
+          </div>
+        </div>
+
+        <!-- Form-field type (shown while the Field tool is armed) -->
+        <div id="at-ff-props" style="display:none">
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_ff_section.type">Type</span>
+            <select class="at-sel" id="at-ff-type" title="Form field type" data-i18n-attr="title:ff_type.form_field_type_tip">
+              <option value="text" data-i18n="ff_type.text_field">Text Field</option>
+              <option value="multiline" data-i18n="ff_type.multiline_text">Multiline Text</option>
+              <option value="checkbox" data-i18n="ff_type.checkbox">Checkbox</option>
+              <option value="dropdown" data-i18n="ff_type.dropdown">Dropdown</option>
+              <option value="listbox" data-i18n="ff_type.list_box">List Box</option>
+              <option value="radio" data-i18n="ff_type.radio_button">Radio Button</option>
+            </select>
+          </div>
+          <div class="at-note" data-i18n="at_ff_props.edit_hint">
+            Drag a field to move it, drag a corner to resize, Del to remove.
+          </div>
+        </div>
+
+        <!-- Redaction notice (shown while the Redact tool is armed).  Redaction
+             destroys the text and the pixels underneath, so the panel says so
+             plainly: Undo works, but only until the document is saved. -->
+        <div id="at-redact-props" style="display:none">
+          <div class="at-note at-note-warn" data-i18n="at_redact_props.permanent_note">
+            Removes the content underneath, not just its appearance. Undo works until you save.
+          </div>
+        </div>
+
+        <!-- Watermark settings (shown while the Watermark tool is armed).
+             Unlike the drag tools this has nothing to drag: the watermark is
+             positioned from the page's own centre, so the panel previews it
+             live over the page you are viewing and a button stamps it. -->
+        <div id="at-wm-props" style="display:none">
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_wm_props.text">Text</span>
+            <input class="at-inp" id="at-wm-text" type="text" value="DRAFT" oninput="wmViewerPreview()">
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_wm_props.style">Style</span>
+            <label class="at-field" title="Watermark size (pt)" data-i18n-attr="title:ed_wm_props.watermark_size_pt_tip">
+              <span class="at-field-lbl" data-i18n="ed_wm_props.size">Size</span>
+              <input class="at-num" id="at-wm-size" type="number" value="60" min="12" max="200" oninput="wmViewerPreview()">
+            </label>
+            <label class="at-field at-field-color" title="Watermark colour" data-i18n-attr="title:ed_wm_props.watermark_colour_tip">
+              <span class="at-field-lbl" data-i18n="ed_wm_props.colour">Colour</span>
+              <input class="at-color" id="at-wm-color" type="color" value="#808080" oninput="wmViewerPreview()">
+            </label>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_wm_props.opacity">Opacity</span>
+            <input id="at-wm-opacity" type="range" min="5" max="80" value="25" style="flex:1;min-width:0;accent-color:var(--accent)" oninput="wmViewerOpacityLabel(); wmViewerPreview()">
+            <span id="at-wm-opacity-lbl" style="font-size:11px;color:var(--text-dim);width:30px;text-align:right;flex-shrink:0">25%</span>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="ed_wm_props.angle">Angle</span>
+            <select class="at-sel" id="at-wm-angle" onchange="wmViewerPreview()">
+              <option value="45">45°</option>
+              <option value="-45">-45°</option>
+              <option value="0" data-i18n="wm_angle.0_flat">0° (flat)</option>
+              <option value="90">90°</option>
+            </select>
+            <span class="at-ctrl-lbl" style="width:auto" data-i18n="ed_wm_props.layout">Layout</span>
+            <select class="at-sel" id="at-wm-layout" onchange="wmViewerPreview()">
+              <option value="center" data-i18n="wm_layout.centred">Centred</option>
+              <option value="tiled" data-i18n="wm_layout.tiled">Tiled</option>
+            </select>
+          </div>
+          <button class="btn btn-ghost tool-full-btn" id="at-wm-apply" style="font-size:12px" onclick="wmViewerApply()" data-i18n="at_wm_props.stamp_this_page">Stamp this page</button>
+          <div class="at-note" id="at-wm-target" data-i18n="at_wm_props.applies_to_current">Applies to the page you are viewing.</div>
+        </div>
+
+        <!-- Crop options (shown while the Crop tool is armed) -->
+        <div id="at-crop-props" style="display:none">
+          <div class="at-note" data-i18n="at_crop_props.hint">
+            Trims the page to the area you drag. The rest of the content stays in the file.
+          </div>
+          <button class="btn btn-ghost tool-full-btn" id="at-crop-clear" style="font-size:12px" onclick="clearViewerCrop()" data-i18n="btn_clear_crop.clear_crop_area">Clear crop area</button>
+        </div>
+
+        <!-- Style rows shared by the drawing tools.  Hidden until a tool that
+             uses them is armed (or an annotation using them is being edited):
+             _refreshStyleRows / _STYLE_ROWS in viewer-panel.js. -->
+        <div id="at-text-props" style="display:none">
+        <!-- Text font -->
+        <div class="at-ctrl-row">
+          <span class="at-ctrl-lbl" data-i18n="annot_tools.font">Font</span>
+          <select class="at-sel" id="at-text-font" title="Text font" data-i18n-attr="title:at_text_font.text_font_tip">
+            <optgroup label="Document fonts (embedded)">
+              <option value="Calibri" data-i18n="at_text_font.calibri">Calibri</option>
+              <option value="Calibri-Bold" data-i18n="at_text_font.calibri_bold">Calibri Bold</option>
+              <option value="Calibri-Italic" data-i18n="at_text_font.calibri_italic">Calibri Italic</option>
+              <option value="Calibri-BoldItalic" data-i18n="at_text_font.calibri_bold_italic">Calibri Bold Italic</option>
+              <option value="Arial" data-i18n="at_text_font.arial">Arial</option>
+              <option value="Arial-Bold" data-i18n="at_text_font.arial_bold">Arial Bold</option>
+              <option value="Arial-Italic" data-i18n="at_text_font.arial_italic">Arial Italic</option>
+              <option value="Arial-BoldItalic" data-i18n="at_text_font.arial_bold_italic">Arial Bold Italic</option>
+              <option value="TimesNR" data-i18n="at_text_font.times_new_roman">Times New Roman</option>
+              <option value="TimesNR-Bold" data-i18n="at_text_font.times_new_roman_bold">Times New Roman Bold</option>
+              <option value="TimesNR-Italic" data-i18n="at_text_font.times_new_roman_italic">Times New Roman Italic</option>
+              <option value="TimesNR-BoldItalic" data-i18n="at_text_font.times_new_roman_bold_2">Times New Roman Bold Italic</option>
+              <option value="CourierNew" data-i18n="at_text_font.courier_new">Courier New</option>
+              <option value="CourierNew-Bold" data-i18n="at_text_font.courier_new_bold">Courier New Bold</option>
+              <option value="CourierNew-Italic" data-i18n="at_text_font.courier_new_italic">Courier New Italic</option>
+              <option value="CourierNew-BoldItalic" data-i18n="at_text_font.courier_new_bold_italic">Courier New Bold Italic</option>
+            </optgroup>
+            <optgroup label="Standard (PDF base-14)">
+              <option value="Helvetica" data-i18n="at_text_font.helvetica">Helvetica</option>
+              <option value="Helvetica-Bold" data-i18n="at_text_font.helvetica_bold">Helvetica Bold</option>
+              <option value="Helvetica-Oblique" data-i18n="at_text_font.helvetica_italic">Helvetica Italic</option>
+              <option value="Helvetica-BoldOblique" data-i18n="at_text_font.helvetica_bold_italic">Helvetica Bold Italic</option>
+              <option value="Times-Roman" data-i18n="at_text_font.times_roman">Times Roman</option>
+              <option value="Times-Bold" data-i18n="at_text_font.times_bold">Times Bold</option>
+              <option value="Times-Italic" data-i18n="at_text_font.times_italic">Times Italic</option>
+              <option value="Courier" data-i18n="at_text_font.courier">Courier</option>
+              <option value="Courier-Bold" data-i18n="at_text_font.courier_bold">Courier Bold</option>
+            </optgroup>
+          </select>
+        </div>
+
+        <!-- Text properties -->
+        <div class="at-ctrl-row">
+          <span class="at-ctrl-lbl" data-i18n="annot_tools.text">Text</span>
+          <label class="at-field" title="Text size" data-i18n-attr="title:annot_tools.text_size_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.size">Size</span>
+            <input class="at-num" id="at-text-size" type="number" min="4" max="96" step="1" value="11">
+          </label>
+          <label class="at-field at-field-color" title="Text colour" data-i18n-attr="title:annot_tools.text_colour_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.colour">Colour</span>
+            <input class="at-color" id="at-text-color" type="color" value="#000000">
+          </label>
+          <label class="at-check" title="Draw a border box around the text (uses the Line colour &amp; weight)" data-i18n-attr="title:annot_tools.draw_a_border_box_tip">
+            <input type="checkbox" id="at-text-box">
+            <span data-i18n="annot_tools.box">Box</span>
+          </label>
+        </div>
+        </div>
+
+        <!-- Line / shape properties — grid so Style sits on a second row,
+             column-aligned under Weight (one flex row overflows the panel) -->
+        <div class="at-ctrl-grid" id="at-line-props" style="display:none">
+          <span class="at-ctrl-lbl" data-i18n="annot_tools.line">Line</span>
+          <label class="at-field at-field-color" title="Line colour" data-i18n-attr="title:annot_tools.line_colour_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.colour">Colour</span>
+            <input class="at-color" id="at-line-color" type="color" value="#ff0000">
+          </label>
+          <label class="at-field" id="at-line-weight-fld" title="Line weight (pt)" data-i18n-attr="title:annot_tools.line_weight_pt_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.weight">Weight</span>
+            <input class="at-num" id="at-line-weight" type="number" min="0.5" max="20" step="0.5" value="1">
+          </label>
+          <label class="at-field at-grid-col3" id="at-line-style-fld" title="Line style (lines, arrows, rectangles &amp; ellipses)" data-i18n-attr="title:annot_tools.line_style_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.style">Style</span>
+            <select class="at-sel" id="at-line-style">
+              <option value="solid" data-i18n="annot_tools.solid">Solid</option>
+              <option value="dashed" data-i18n="annot_tools.dashed">Dashed</option>
+              <option value="dotted" data-i18n="annot_tools.dotted">Dotted</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- Fill properties (rectangle &amp; ellipse only) -->
+        <div class="at-ctrl-row" id="at-fill-props" style="display:none">
+          <span class="at-ctrl-lbl" data-i18n="annot_tools.fill">Fill</span>
+          <label class="at-check" title="Fill the shape interior (rectangle &amp; ellipse)" data-i18n-attr="title:annot_tools.fill_the_shape_interior_tip">
+            <input type="checkbox" id="at-fill-on">
+            <span data-i18n="annot_tools.on">On</span>
+          </label>
+          <label class="at-field at-field-color" title="Fill colour" data-i18n-attr="title:annot_tools.fill_colour_tip">
+            <span class="at-field-lbl" data-i18n="annot_tools.colour">Colour</span>
+            <input class="at-color" id="at-fill-color" type="color" value="#ffff00">
+          </label>
+        </div>
+
+        <!-- Sticky-note properties (shown only while the Sticky tool is armed) -->
+        <div id="at-sticky-props" style="display:none">
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_sticky_props.colour">Colour</span>
+            <select class="at-sel" id="at-sticky-color" title="Sticky note colour" data-i18n-attr="title:at_sticky_color.sticky_note_colour_tip">
+              <option value="yellow" data-i18n="at_sticky_color.yellow">Yellow</option>
+              <option value="green" data-i18n="at_sticky_color.green">Green</option>
+              <option value="blue" data-i18n="at_sticky_color.blue">Blue</option>
+              <option value="red" data-i18n="at_sticky_color.red">Red</option>
+              <option value="purple" data-i18n="at_sticky_color.purple">Purple</option>
+            </select>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_sticky_props.note">Note</span>
+            <textarea id="at-sticky-text" placeholder="Sticky note text&hellip;"
+                      style="flex:1;min-width:0;min-height:54px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:11px;padding:6px 8px;outline:none;resize:vertical;line-height:1.4" data-i18n-attr="placeholder:at_sticky_text.sticky_note_text_ph"></textarea>
+          </div>
+          <div class="at-hint" data-i18n="at_sticky_props.click_on_the_page">Click on the page to place the note.</div>
+        </div>
+
+        <!-- Signature properties (shown only while the Signature tool is armed) -->
+        <div id="at-sig-props" style="display:none">
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_sig_props.name">Name</span>
+            <input id="at-sig-name" type="text" placeholder="Your name" oninput="_sigPreview()"
+                   style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:11px;padding:5px 8px;outline:none" data-i18n-attr="placeholder:at_sig_name.your_name_ph">
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_sig_props.style">Style</span>
+            <select class="at-sel" id="at-sig-font" onchange="_sigPreview()">
+              <option value="'Segoe Script', cursive" data-i18n="at_sig_font.segoe_script">Segoe Script</option>
+              <option value="'Brush Script MT', cursive" data-i18n="at_sig_font.brush_script">Brush Script</option>
+              <option value="'Lucida Handwriting', cursive" data-i18n="at_sig_font.lucida_handwriting">Lucida Handwriting</option>
+              <option value="'Ink Free', cursive" data-i18n="at_sig_font.ink_free">Ink Free</option>
+              <option value="'Segoe Print', cursive" data-i18n="at_sig_font.segoe_print">Segoe Print</option>
+            </select>
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_sig_props.size">Size</span>
+            <input class="at-num" id="at-sig-size" type="number" min="8" max="96" step="1" value="24" oninput="_sigPreview()">
+            <span class="at-ctrl-lbl" style="width:auto;padding-left:8px" data-i18n="at_sig_props.colour">Colour</span>
+            <input class="at-color" id="at-sig-color" type="color" value="#1a1a80" oninput="_sigPreview()">
+          </div>
+          <div id="at-sig-preview" style="min-height:42px;margin:6px 0;padding:6px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis"></div>
+          <div class="at-hint" data-i18n="at_sig_props.click_on_the_page">Click on the page to place your signature.</div>
+        </div>
+
+        <!-- Shown only while an annotation is selected/being edited -->
+        <button id="at-delete-btn" class="at-delete-btn" style="display:none"
+                onclick="deleteSelectedAnnotation()" title="Delete the selected item (Del)" data-i18n="at_delete_btn.delete_selected" data-i18n-attr="title:at_delete_btn.delete_selected_tip">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="13" height="13"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/></svg>
+          Delete selected
+        </button>
+        <div class="at-hint" id="at-idle-hint" data-i18n="annot_tools.pointer_tool_click_an">Pick a tool above. With none picked, click a comment on the page to select &amp; edit it, or drag a box around several. Ctrl+C / Ctrl+V to copy &amp; paste; Del to remove.</div>
+      </div>
+
+      <!-- ── Comments in the document: under the Comment tools, because
+           reviewing and reading the list go together.  Outside #annot-tools
+           so a read-only document still lets you read and jump to them. -->
+      <div id="rp-comments">
+        <div class="at-title at-section" data-i18n="comments.list_title">Comments in this document</div>
+        <!-- Type / author / status filters: built by renderComments from what
+             the document actually contains. -->
+        <div id="comment-filters"></div>
+        <div id="comment-list"></div>
+      </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Floating zoom pill — placed after #right-panel so CSS can track its collapse -->
+  <div id="zoom-pill" class="zoom-pill" role="group" aria-label="Zoom" data-i18n-attr="aria-label:zoom_pill.zoom_aria">
+    <button class="zp-btn" onclick="zoomOut()" title="Zoom out (Ctrl+scroll)" aria-label="Zoom out" data-i18n-attr="title:zoom_pill.zoom_out_ctrl_scroll_tip;aria-label:zoom_pill.zoom_out_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+    <button class="zp-label" id="zoom-label" onclick="zoomReset()" title="Reset zoom to 100%" aria-label="Reset zoom to 100%" data-i18n-attr="title:zoom_label.reset_zoom_to_100_tip;aria-label:zoom_label.reset_zoom_to_100_aria">100%</button>
+    <button class="zp-btn" onclick="zoomIn()" title="Zoom in (Ctrl+scroll)" aria-label="Zoom in" data-i18n-attr="title:zoom_pill.zoom_in_ctrl_scroll_tip;aria-label:zoom_pill.zoom_in_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>
+    <div class="zp-sep"></div>
+    <button class="zp-btn zp-fit" onclick="zoomFitWidth()" title="Fit page to window width" aria-label="Fit page to window width" data-i18n="zoom_pill.fit" data-i18n-attr="title:zoom_pill.fit_page_to_window_tip;aria-label:zoom_pill.fit_page_to_window_aria">Fit</button>
+    <div class="zp-sep"></div>
+    <button class="zp-btn" id="zp-twoup" onclick="toggleTwoUp()" title="Two pages side by side" aria-label="Two pages side by side" aria-pressed="false" data-i18n-attr="title:zp_twoup.two_pages_side_by_tip;aria-label:zp_twoup.two_pages_side_by_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="8" height="16" rx="1"/><rect x="13" y="4" width="8" height="16" rx="1"/></svg>
+    </button>
+  </div>
+
+</div>
+
+<!-- ── Document Properties (metadata) modal ── -->
+<div id="doc-props-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9700;align-items:center;justify-content:center" onclick="if(event.target===this)closeDocProperties()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:440px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="color:var(--accent2);flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      <span style="font-size:16px;font-weight:700" data-i18n="doc_props_modal.document_properties">Document Properties</span>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:22px">
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:5px" data-i18n="doc_props_modal.title">Title</label>
+        <input id="meta-title" type="text" placeholder="Document title"
+               style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s"
+               onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'" data-i18n-attr="placeholder:meta_title.document_title_ph">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:5px" data-i18n="doc_props_modal.author">Author</label>
+        <input id="meta-author" type="text" placeholder="Author name"
+               style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s"
+               onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'" data-i18n-attr="placeholder:meta_author.author_name_ph">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:5px" data-i18n="doc_props_modal.subject">Subject</label>
+        <input id="meta-subject" type="text" placeholder="Document subject"
+               style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s"
+               onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'" data-i18n-attr="placeholder:meta_subject.document_subject_ph">
+      </div>
+      <div>
+        <label style="font-size:11px;color:var(--text-dim);display:block;margin-bottom:5px" data-i18n="doc_props_modal.keywords">Keywords</label>
+        <input id="meta-keywords" type="text" placeholder="Comma-separated keywords"
+               style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none;transition:border-color .15s"
+               onfocus="this.style.borderColor='var(--accent)'" onblur="this.style.borderColor='var(--border)'" data-i18n-attr="placeholder:meta_keywords.comma_separated_keywords_ph">
+      </div>
+    </div>
+    <p style="font-size:11px;color:var(--text-dim);margin-bottom:18px;line-height:1.5" data-i18n="doc_props_modal.changes_are_saved_to">Changes are saved to the PDF when you save the document.</p>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="closeDocProperties()" data-i18n="doc_props_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="saveDocProperties()" data-i18n="doc_props_modal.apply">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Apply
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Auto-bookmark preview modal ── -->
+<div id="auto-bm-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9700;align-items:center;justify-content:center" onclick="if(event.target===this)closeAutoBookmarkModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;max-width:520px;width:90%;max-height:80vh;display:flex;flex-direction:column;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent2);flex-shrink:0"><path d="M5 3v4M3 5h4M6 17v4m-2-2h4"/><path d="M13 3l3.5 8.5L21 13l-4.5 1.5L13 23l-3.5-8.5L5 13l4.5-1.5z"/></svg>
+      <span style="font-size:16px;font-weight:700" data-i18n="auto_bm_modal.suggested_bookmarks">Suggested Bookmarks</span>
+    </div>
+    <div id="auto-bm-subtitle" style="font-size:12px;color:var(--text-dim);margin-bottom:14px;line-height:1.5"></div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span id="auto-bm-count" style="font-size:11px;color:var(--text-dim)"></span>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="abSelectAll(true)" data-i18n="auto_bm_modal.select_all">Select all</button>
+        <button class="btn btn-ghost" style="padding:3px 8px;font-size:11px" onclick="abSelectAll(false)" data-i18n="auto_bm_modal.none">None</button>
+      </div>
+    </div>
+    <div id="auto-bm-list" style="flex:1;overflow-y:auto;border:1px solid var(--border);border-radius:8px;padding:6px;min-height:120px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px">
+      <button class="btn btn-ghost" onclick="closeAutoBookmarkModal()" data-i18n="auto_bm_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" id="auto-bm-add-btn" onclick="confirmAutoBookmarks()" data-i18n="auto_bm_add_btn.add_selected">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="20 6 9 17 4 12"/></svg>
+        Add selected
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Password Protect modal (save-time encryption) ── -->
+<div id="pw-protect-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9800;align-items:center;justify-content:center" onclick="if(event.target===this)closePasswordProtectModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:380px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="color:var(--accent);flex-shrink:0"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      <span style="font-size:16px;font-weight:700" data-i18n="pw_protect_modal.password_protect">Password Protect</span>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px;line-height:1.5" data-i18n="pw_protect_modal.the_pdf_will_be">The PDF will be encrypted when saved. Anyone opening it will need this password.</p>
+
+    <!-- Set password section -->
+    <div id="pp-set-section">
+      <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:18px">
+        <div>
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:5px" data-i18n="pp_set_section.password">Password</div>
+          <input id="pp-password" type="password" autocomplete="new-password"
+                 placeholder="Enter password"
+                 style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none"
+                 onkeydown="if(event.key==='Enter')document.getElementById('pp-confirm').focus()" data-i18n-attr="placeholder:pp_password.enter_password_ph">
+        </div>
+        <div>
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:5px" data-i18n="pp_set_section.confirm_password">Confirm password</div>
+          <input id="pp-confirm" type="password" autocomplete="new-password"
+                 placeholder="Re-enter password"
+                 style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none"
+                 onkeydown="if(event.key==='Enter')savePasswordProtection()" data-i18n-attr="placeholder:pp_confirm.re_enter_password_ph">
+        </div>
+        <div id="pp-error" style="display:none;font-size:12px;color:var(--danger)"></div>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost" onclick="closePasswordProtectModal()" data-i18n="pp_set_section.cancel">Cancel</button>
+        <button class="btn btn-accent" onclick="savePasswordProtection()" data-i18n="pp_set_section.protect">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          Protect
+        </button>
+      </div>
+    </div>
+
+    <!-- Already protected section -->
+    <div id="pp-protected-section" style="display:none">
+      <div style="display:flex;align-items:center;gap:10px;background:rgba(232,255,87,.08);border:1px solid rgba(232,255,87,.25);border-radius:8px;padding:12px 14px;margin-bottom:18px">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        <span style="font-size:13px;color:var(--accent)" data-i18n="pp_protected_section.this_document_is_password">This document is password protected</span>
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost" onclick="closePasswordProtectModal()" data-i18n="pp_protected_section.close">Close</button>
+        <button class="btn btn-ghost" onclick="showChangePassword()" data-i18n="pp_protected_section.change_password">Change Password</button>
+        <button class="btn btn-danger" onclick="removePasswordProtection()" data-i18n="pp_protected_section.remove_protection">Remove Protection</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Open-PDF password dialog (for encrypted files) ── -->
+<div id="pw-open-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9900;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:360px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" style="color:var(--accent2);flex-shrink:0"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      <span style="font-size:16px;font-weight:700" data-i18n="pw_open_modal.password_required">Password Required</span>
+    </div>
+    <p id="pw-open-filename" style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.5"></p>
+    <input id="pw-open-input" type="password" autocomplete="current-password"
+           placeholder="Enter password"
+           style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:8px 10px;font-size:13px;outline:none;margin-bottom:10px"
+           onkeydown="if(event.key==='Enter')submitOpenPassword()" data-i18n-attr="placeholder:pw_open_input.enter_password_ph">
+    <div id="pw-open-error" style="display:none;font-size:12px;color:var(--danger);margin-bottom:10px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="cancelOpenPassword()" data-i18n="pw_open_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="submitOpenPassword()" data-i18n="pw_open_modal.open">Open</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sticky note tooltip -->
+<div id="annot-tooltip">
+  <div id="annot-tooltip-author"></div>
+  <div id="annot-tooltip-text"></div>
+</div>
+
+<!-- Annotation edit popup -->
+<div id="annot-edit-popup" style="display:none">
+  <div id="annot-edit-header">
+    <span data-i18n="annot_edit_header.edit_comment">Edit Comment</span>
+    <button onclick="closeAnnotEdit()" title="Close" aria-label="Close comment editor" data-i18n-attr="title:annot_edit_header.close_tip;aria-label:annot_edit_header.close_comment_editor_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" width="16" height="16"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div id="annot-edit-author-row">
+    <label for="annot-edit-author" data-i18n="annot_edit_author_row.author">Author</label>
+    <input id="annot-edit-author" type="text" placeholder="Author name…" autocomplete="off" data-i18n-attr="placeholder:annot_edit_author.author_name_ph">
+  </div>
+  <textarea id="annot-edit-text" placeholder="Comment text…" rows="5" data-i18n-attr="placeholder:annot_edit_text.comment_text_ph"></textarea>
+  <div id="annot-edit-actions">
+    <button class="btn btn-ghost" id="annot-edit-delete" onclick="deleteAnnotEdit()"
+            style="margin-right:auto;color:var(--danger)" data-i18n="annot_edit_delete.delete">Delete</button>
+    <button class="btn btn-ghost" onclick="closeAnnotEdit()" data-i18n="annot_edit_actions.cancel">Cancel</button>
+    <button class="btn" id="annot-edit-save" onclick="saveAnnotEdit()" data-i18n="annot_edit_save.save">Save</button>
+  </div>
+</div>
+
+<!-- Viewer tool context menu -->
+<div id="viewer-ctx-menu">
+  <div class="vctx-item" id="vctx-pointer" onclick="setViewerTool('pointer')" data-i18n="vctx_pointer.pointer_tool">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 4 7.07 17 2.51-7.39L21 11.07z"/></svg>
+    Pointer Tool
+  </div>
+  <div class="vctx-item" id="vctx-hand" onclick="setViewerTool('hand')" data-i18n="vctx_hand.hand_tool">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 0 0-4 0"/><path d="M14 10V4a2 2 0 0 0-4 0v2"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
+    Hand Tool
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item" id="vctx-bookmark" onclick="addBookmarkAtCtx()" data-i18n="vctx_bookmark.add_bookmark_here">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h7"/><line x1="17" y1="3" x2="17" y2="9"/><line x1="14" y1="6" x2="20" y2="6"/></svg>
+    Add bookmark here
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item" id="vctx-fullscreen" onclick="enterFullscreen()" data-i18n="vctx_fullscreen.fullscreen">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
+    Fullscreen
+  </div>
+</div>
+
+<!-- Right-click menu on a run of the page's own text (the Pointer).  Row / area
+     is v2.24's "Merge row": edit several words, across lines, as one block. -->
+<div id="et-ctx-menu" class="vctx-menu">
+  <div class="vctx-item" onclick="etCtxEdit()" data-i18n="et_ctx.edit_text">Edit text</div>
+  <div class="vctx-item" onclick="etCtxBlock()" data-i18n="et_ctx.edit_block">Edit row / area…</div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item danger" onclick="etCtxDelete()" data-i18n="et_ctx.delete">Delete</div>
+</div>
+
+<!-- Right-click menu for a bookmark item (shares vctx styling) -->
+<!-- Page-rail context menu — the viewer's thumbnail list is a page list, so it
+     offers the same page operations Layout's cards do, without a mode switch. -->
+<div id="pg-ctx-menu" class="vctx-menu">
+  <div class="menu-label" data-i18n="pg_ctx.rotate">Rotate</div>
+  <div class="vctx-item" onclick="pgCtxRotate(90)" data-i18n="pg_ctx.rotate_cw">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38"/></svg>
+    Rotate 90&deg; Clockwise
+  </div>
+  <div class="vctx-item" onclick="pgCtxRotate(-90)" data-i18n="pg_ctx.rotate_ccw">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2.5 2v6h6M2.66 15.57a10 10 0 1 0 .57-8.38"/></svg>
+    Rotate 90&deg; Counter-CW
+  </div>
+  <div class="vctx-item" onclick="pgCtxRotate(180)" data-i18n="pg_ctx.rotate_180">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.44"/></svg>
+    Rotate 180&deg;
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-sep"></div>
+  <div class="menu-label" data-i18n="pg_ctx.insert_blank">Insert blank page</div>
+  <div class="vctx-item" onclick="pgCtxInsertBlank(true)" data-i18n="pg_ctx.insert_before">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+    Insert Before
+  </div>
+  <div class="vctx-item" onclick="pgCtxInsertBlank(false)" data-i18n="pg_ctx.insert_after">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+    Insert After
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item danger" id="pgctx-delete" onclick="pgCtxDelete()" data-i18n="pg_ctx.delete_page">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+    Delete Page
+  </div>
+</div>
+
+<div id="bm-ctx-menu" class="vctx-menu">
+  <div class="vctx-item" id="bmctx-rename" onclick="renameBookmarkCtx()" data-i18n="bmctx_rename.rename">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+    Rename
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item" id="bmctx-up" onclick="moveBookmark('up')" data-i18n="bmctx_up.move_up">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+    Move up
+  </div>
+  <div class="vctx-item" id="bmctx-down" onclick="moveBookmark('down')" data-i18n="bmctx_down.move_down">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+    Move down
+  </div>
+  <div class="vctx-sep"></div>
+  <div class="vctx-item danger" id="bmctx-delete" onclick="deleteBookmarkCtx()" data-i18n="bmctx_delete.delete">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    Delete
+  </div>
+  <div class="vctx-item danger" id="bmctx-delete-selected" onclick="deleteSelectedBookmarksCtx()">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+    <!-- Label carries a live count, so showBookmarkCtx() sets it instead of data-i18n. -->
+    <span id="bmctx-delsel-label">Delete selected</span>
+  </div>
+  <div class="vctx-item danger" id="bmctx-delete-all" onclick="deleteAllBookmarksCtx()" data-i18n="bmctx_delete_all.delete_all">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="9" y1="2" x2="15" y2="2"/></svg>
+    Delete all
+  </div>
+</div>
+
+<!-- Fullscreen ESC hint — shown briefly when entering fullscreen -->
+<div id="fullscreen-esc-hint" data-i18n="fullscreen_esc_hint.press_esc_to_return">Press ESC to return to normal view</div>
+
+<!-- Table-detected modal -->
+<div id="table-modal-overlay">
+  <div id="table-modal">
+    <div class="tmodal-hd">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/>
+        <line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/>
+      </svg>
+      <h3 data-i18n="table_modal.table_detected">Table detected</h3>
+    </div>
+    <div class="tmodal-body" data-i18n="table_modal.the_selected_content_looks">The selected content looks like a table. Would you like to open it in Excel, or continue with a normal text copy?</div>
+    <div class="tmodal-actions">
+      <button class="btn btn-accent" onclick="_tableModalExcel()" data-i18n="table_modal.open_in_excel">Open in Excel</button>
+      <button class="btn btn-ghost" onclick="_tableModalCopy()" data-i18n="table_modal.copy_as_text">Copy as text</button>
+    </div>
+  </div>
+</div>
+
+<!-- Print dialog: pick pages in-app, then hand only the selection to the OS
+     print preview (avoids WebView2 re-rendering the whole document per keystroke). -->
+<div id="print-modal-overlay">
+  <div id="print-modal" role="dialog" aria-modal="true" aria-labelledby="print-modal-title">
+    <div class="pmodal-hd">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/>
+      </svg>
+      <h3 id="print-modal-title" data-i18n="print_modal_title.print">Print</h3>
+      <span class="pmodal-count" id="print-count" data-i18n="print_count.0_pages_selected">0 pages selected</span>
+    </div>
+
+    <div class="pmodal-modes">
+      <label data-i18n="print_modal.all_pages"><input type="radio" name="print-mode" value="all" onchange="_printSetMode('all')"> All pages</label>
+      <label data-i18n="print_modal.current_page"><input type="radio" name="print-mode" value="current" onchange="_printSetMode('current')"> Current page</label>
+      <label data-i18n="print_modal.custom"><input type="radio" name="print-mode" value="custom" onchange="_printSetMode('custom')"> Custom</label>
+    </div>
+
+    <div class="pmodal-range">
+      <input type="text" id="print-range" placeholder="e.g. 1, 3, 10-12"
+             autocomplete="off" spellcheck="false"
+             oninput="_printRangeInput()" onfocus="_printSetMode('custom')" data-i18n-attr="placeholder:print_range.e_g_1_3_ph">
+      <div class="pmodal-error" id="print-range-error"></div>
+    </div>
+
+    <div class="pmodal-grid" id="print-thumb-grid"><!-- thumbnails injected --></div>
+
+    <!-- Section navigator: only shown for long docs (see PRINT_SECTION_THRESHOLD). -->
+    <div class="pmodal-sections" id="print-sections" hidden>
+      <button type="button" class="pmodal-sec-btn" id="print-sec-prev" onclick="_printSectionStep(-1)"
+              data-i18n="print_section.prev">‹ Prev</button>
+      <div class="pmodal-sec-mid">
+        <select id="print-sec-jump" onchange="_printSectionGo(+this.value)"
+                aria-label="Jump to section" data-i18n-attr="aria-label:print_section.jump_aria"></select>
+        <span class="pmodal-sec-label" id="print-sec-label"></span>
+      </div>
+      <button type="button" class="pmodal-sec-btn" id="print-sec-next" onclick="_printSectionStep(1)"
+              data-i18n="print_section.next">Next ›</button>
+    </div>
+
+    <div class="pmodal-actions">
+      <button class="btn btn-accent" id="print-go-btn" onclick="_printConfirm()" data-i18n="print_go_btn.print">Print</button>
+      <button class="btn btn-ghost" onclick="_hidePrintModal()" data-i18n="print_modal.cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     LAYOUT PANEL
+════════════════════════════════════════════════════════ -->
+<div id="panel-layout" class="app-panel">
+
+<div id="sticky-top">
+<header>
+  <div class="header-left">
+    <div class="logo-small" data-i18n="sticky_top.layout">Patchwork<span>PDF</span> &mdash; Layout</div>
+  </div>
+  <div class="header-actions">
+    <button class="btn btn-ghost" id="save-btn" onclick="saveDocument()" disabled title="Save the selected pages (all pages by default)" data-i18n="save_btn.save" data-i18n-attr="title:save_btn.save_the_selected_pages_tip">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+      Save
+    </button>
+    <button class="btn btn-ghost" onclick="switchToViewerFromLayout()" title="Return to viewer" data-i18n="sticky_top.return" data-i18n-attr="title:sticky_top.return_to_viewer_tip">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+      Return
+    </button>
+    <button class="btn btn-ghost btn-icon" onclick="toggleTheme()" title="Toggle light / dark theme" aria-label="Toggle light or dark theme" data-i18n-attr="title:sticky_top.toggle_light_dark_theme_tip;aria-label:sticky_top.toggle_light_or_dark_aria">
+      <svg class="theme-icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="theme-icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="5"/><line x1="12" y1="19" x2="12" y2="22"/><line x1="4.2" y1="4.2" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.8" y2="19.8"/><line x1="2" y1="12" x2="5" y2="12"/><line x1="19" y1="12" x2="22" y2="12"/><line x1="4.2" y1="19.8" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.8" y2="4.2"/></svg>
+    </button>
+    <button class="btn btn-ghost btn-icon" onclick="openShortcutsOverlay()" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" data-i18n-attr="title:sticky_top.keyboard_shortcuts_tip;aria-label:sticky_top.keyboard_shortcuts_aria">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/></svg>
+    </button>
+    <button class="btn btn-ghost" onclick="showAbout()" title="About Patchwork PDF" data-i18n="sticky_top.about" data-i18n-attr="title:sticky_top.about_patchwork_pdf_tip">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      About
+    </button>
+    <!-- Language selector — same slot, same options, in all three modes. -->
+    <select class="btn btn-ghost" id="lang-select-layout" data-lang-select
+            onchange="I18N.setLang(this.value)"
+            title="Language" aria-label="Language"
+            data-i18n-attr="title:viewer.header.language_tip;aria-label:viewer.header.language_tip">
+      <option value="en">English</option>
+      <option value="es">Español</option>
+      <option value="fr">Français</option>
+      <option value="de">Deutsch</option>
+      <option value="it">Italiano</option>
+    </select>
+  </div>
+</header>
+
+<!-- Layout toolbar.  Same contract as the viewer's #toolbar: one non-wrapping
+     row, groups divided by .tool-sep rules (not text labels), a flex spacer,
+     then the selection-state chip.  The chip replaces the old prose hint — it
+     is what tells you the scope of Rotate / Move / Compress / Delete / Save.
+     Mouse gestures moved to the shortcuts overlay (SHORTCUTS in shared.js). -->
+<div class="toolbar">
+
+  <button id="file-menu-btn-layout" class="btn btn-ghost" onclick="toggleFileMenu(event, 'file-menu-btn-layout')"
+          aria-haspopup="true" aria-expanded="false" title="File menu" data-i18n="file_menu_btn.file" data-i18n-attr="title:file_menu_btn.file_menu_tip">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    File
+    <svg class="fm-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 12 15 18 9"/></svg>
+  </button>
+  <div class="tool-sep"></div>
+
+  <!-- Add pages -->
+  <button class="btn btn-ghost" onclick="addFiles()" title="Add files to the end of the document" data-i18n="sticky_top.add_files" data-i18n-attr="title:sticky_top.add_files_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    Add Files
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Selection -->
+  <button class="btn btn-ghost" id="selectall-btn" onclick="selectAllPages()" disabled title="Check every page" data-i18n="selectall_btn.select_all" data-i18n-attr="title:selectall_btn.check_every_page_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="8 12 11 15 16 9"/></svg>
+    Select All
+  </button>
+  <button class="btn btn-ghost" id="deselectall-btn" onclick="deselectAllPages()" disabled title="Uncheck every page" data-i18n="deselectall_btn.deselect_all" data-i18n-attr="title:deselectall_btn.uncheck_every_page_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+    Deselect All
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Acts on the checked pages (see the selection chip at the far right) -->
+  <button class="btn btn-ghost" id="rotate-cw-btn" onclick="rotateSelected(90)" disabled title="Rotate selected pages clockwise" data-i18n="rotate_cw_btn.rotate_cw" data-i18n-attr="title:rotate_cw_btn.rotate_selected_pages_clockwise_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38"/></svg>
+    Rotate CW
+  </button>
+  <button class="btn btn-ghost" id="rotate-ccw-btn" onclick="rotateSelected(-90)" disabled title="Rotate selected pages counter-clockwise" data-i18n="rotate_ccw_btn.rotate_ccw" data-i18n-attr="title:rotate_ccw_btn.rotate_selected_pages_counter_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2.5 2v6h6M2.66 15.57a10 10 0 1 0 .57-8.38"/></svg>
+    Rotate CCW
+  </button>
+  <button class="btn btn-ghost btn-icon" id="move-front-btn" onclick="moveSelectedToFront()" disabled aria-label="Move to Front" title="Move selected pages to the front" data-i18n-attr="aria-label:move_front_btn.move_to_front;title:move_front_btn.move_selected_to_front_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="4" x2="20" y2="4"/><line x1="12" y1="21" x2="12" y2="9"/><polyline points="8 13 12 9 16 13"/></svg>
+  </button>
+  <button class="btn btn-ghost btn-icon" id="move-back-btn" onclick="moveSelectedToBack()" disabled aria-label="Move to Back" title="Move selected pages to the back" data-i18n-attr="aria-label:move_back_btn.move_to_back;title:move_back_btn.move_selected_to_back_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="20" y2="20"/><line x1="12" y1="3" x2="12" y2="15"/><polyline points="8 11 12 15 16 11"/></svg>
+  </button>
+  <button class="btn btn-ghost" id="compress-btn" onclick="showCompress()" disabled title="Compress selected pages" data-i18n="compress_btn.compress" data-i18n-attr="title:compress_btn.compress_selected_pages_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="20" x2="21" y2="9"/><line x1="3" y1="15" x2="14" y2="4"/></svg>
+    Compress
+  </button>
+  <button class="btn btn-ghost" id="delete-sel-btn" onclick="deleteSelectedPages()" disabled title="Delete selected pages" data-i18n="delete_sel_btn.delete" data-i18n-attr="title:delete_sel_btn.delete_selected_pages_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+    Delete
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Whole-document -->
+  <button class="btn btn-ghost" id="export-btn" onclick="showExportModal()" disabled title="Export every page to Word or Excel" data-i18n="export_btn.export_as" data-i18n-attr="title:export_btn.export_as_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    Export As
+  </button>
+  <button class="btn btn-ghost" id="hf-btn" onclick="showHFModal()" disabled title="Stamp a header and footer on every page" data-i18n="hf_btn.header_footer" data-i18n-attr="title:hf_btn.header_footer_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="5" x2="21" y2="5"/><line x1="3" y1="19" x2="21" y2="19"/><rect x="3" y="8" width="18" height="8" rx="1"/></svg>
+    Header / Footer
+  </button>
+
+  <div class="tool-sep"></div>
+
+  <!-- Clear All is the most destructive control in the app: it gets its own
+       island here rather than sitting beside Save in the header. -->
+  <button class="btn btn-ghost" id="clear-all-btn" onclick="clearAll()" disabled title="Remove all pages" data-i18n="sticky_top.clear_all" data-i18n-attr="title:sticky_top.remove_all_pages_tip">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+    Clear All
+  </button>
+
+  <div style="flex:1"></div>
+
+  <!-- Selection state — the scope every selection-scoped button above acts on.
+       Sticky, so a narrow window scrolls the buttons under it and never hides it. -->
+  <span class="toolbar-tail">
+    <button class="btn btn-ghost btn-icon" onclick="printDocument()" title="Print document (Ctrl+P)" aria-label="Print document" data-i18n-attr="title:toolbar.print_document_ctrl_p_tip;aria-label:toolbar.print_document_aria">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+    </button>
+    <!-- No data-i18n here: the text is computed by updateSelectionUI(), and a
+         static key would re-stamp "0 pages" over the live count on every
+         language change.  Re-localised via the pw-lang-changed listener. -->
+    <span class="page-count" id="page-count-badge">0 pages</span>
+  </span>
+</div>
+
+<!-- Compact drop bar — visible when pages are loaded, stays frozen at top -->
+<div id="compact-dropbar"
+  ondragover="handleCompactDragOver(event)"
+  ondragleave="handleCompactDragLeave(event)"
+  ondrop="handleCompactDrop(event)"
+  onclick="addFiles()">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+  <span data-i18n="compact_dropbar.drop_more_files_to">Drop more files to add pages, or click here</span>
+</div>
+
+</div><!-- /#sticky-top -->
+
+<main id="layout-main"
+  ondragover="handleMainDragOver(event)"
+  ondragleave="handleMainDragLeave(event)"
+  ondrop="handleMainDrop(event)">
+  <!-- Drop Zone — visual cue + click-to-add; the whole <main> is the drop target -->
+  <div id="drop-zone"
+    onclick="addFiles()">
+    <input type="file" id="file-input" multiple accept=".pdf,.doc,.docx,.odt,.rtf,.xls,.xlsx,.ods,.csv,.txt,.png,.jpg,.jpeg,.gif,.bmp,.tif,.tiff,.webp" onchange="handleFileSelect(event)">
+
+    <div class="drop-icon">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+        <polyline points="17 8 12 3 7 8"/>
+        <line x1="12" y1="3" x2="12" y2="15"/>
+      </svg>
+    </div>
+    <div class="drop-title" data-i18n="drop_zone.drop_files_here">Drop files here</div>
+    <div class="drop-sub" data-i18n="drop_zone.formats_hint">PDF, Word, Excel, OpenDocument or text &mdash; you can add multiple files at once</div>
+    <button class="btn btn-accent" style="pointer-events:none" data-i18n="drop_zone.choose_files">Choose Files</button>
+
+
+  </div>
+
+  <!-- Page Grid -->
+  <div id="pages-grid"></div>
+
+  <!-- Empty hint -->
+  <div id="empty-state">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" style="color:var(--border); margin-bottom:16px"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    <p style="font-size:16px; font-weight:600; margin-bottom:6px" data-i18n="empty_state.no_pages_yet">No pages yet</p>
+    <p style="font-size:13px" data-i18n="empty_state.upload_pdf_files_above">Upload PDF files above to get started</p>
+  </div>
+</main>
+
+<!-- Floating zoom pill — matches the viewer's and editor's. Here it scales the
+     page cards in the grid rather than a rendered page. -->
+<div id="lay-zoom-pill" class="zoom-pill" role="group" aria-label="Thumbnail size" data-i18n-attr="aria-label:lay_zoom_pill.thumbnail_size_aria">
+  <button class="zp-btn" onclick="layZoomOut()" title="Smaller pages (Ctrl+−)" aria-label="Smaller pages" data-i18n-attr="title:lay_zoom_pill.zoom_out_tip;aria-label:lay_zoom_pill.zoom_out_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+  <button class="zp-label" id="lay-zoom-label" onclick="layZoomReset()" title="Reset page size (Ctrl+0)" aria-label="Reset page size" data-i18n-attr="title:lay_zoom_pill.reset_tip;aria-label:lay_zoom_pill.reset_aria">100%</button>
+  <button class="zp-btn" onclick="layZoomIn()" title="Larger pages (Ctrl++)" aria-label="Larger pages" data-i18n-attr="title:lay_zoom_pill.zoom_in_tip;aria-label:lay_zoom_pill.zoom_in_aria">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+</div>
+
+<!-- Context Menu — acts on the single right-clicked page (bulk actions are in the toolbar) -->
+<div id="context-menu">
+  <div class="menu-label" data-i18n="context_menu.rotate">Rotate</div>
+  <div class="menu-item" onclick="contextRotate(90)" data-i18n="context_menu.rotate_90_cw">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38"/></svg>
+    Rotate 90&deg; Clockwise
+  </div>
+  <div class="menu-item" onclick="contextRotate(-90)" data-i18n="context_menu.rotate_90_ccw">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2.5 2v6h6M2.66 15.57a10 10 0 1 0 .57-8.38"/></svg>
+    Rotate 90&deg; Counter-CW
+  </div>
+  <div class="menu-item" onclick="contextRotate(180)" data-i18n="context_menu.rotate_180">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.44"/></svg>
+    Rotate 180&deg;
+  </div>
+  <div class="menu-divider"></div>
+  <div class="menu-label" data-i18n="context_menu.reorder">Reorder</div>
+  <div class="menu-item" onclick="contextMoveToFront()" data-i18n="context_menu.move_to_front">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="4" x2="20" y2="4"/><line x1="12" y1="21" x2="12" y2="9"/><polyline points="8 13 12 9 16 13"/></svg>
+    Move to Front
+  </div>
+  <div class="menu-item" onclick="contextMoveToBack()" data-i18n="context_menu.move_to_back">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="20" x2="20" y2="20"/><line x1="12" y1="3" x2="12" y2="15"/><polyline points="8 11 12 15 16 11"/></svg>
+    Move to Back
+  </div>
+  <div class="menu-divider"></div>
+  <div class="menu-label" data-i18n="context_menu.insert_blank_page">Insert blank page</div>
+  <div class="menu-item" onclick="contextInsertBlank(true)" data-i18n="context_menu.insert_before">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+    Insert Before
+  </div>
+  <div class="menu-item" onclick="contextInsertBlank(false)" data-i18n="context_menu.insert_after">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+    Insert After
+  </div>
+  <div class="menu-divider"></div>
+  <div class="menu-item danger" onclick="contextDelete()" data-i18n="context_menu.delete_page">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+    Delete Page
+  </div>
+</div>
+
+<!-- Insert Blank Page modal -->
+<div id="insert-blank-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center" onclick="if(event.target===this)closeInsertBlankModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:420px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="font-size:16px;font-weight:700;margin-bottom:6px;display:flex;align-items:center;gap:9px">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+      <span id="insert-blank-title" data-i18n="insert_blank_title.insert_blank_page">Insert Blank Page</span>
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:18px;line-height:1.5" data-i18n="insert_blank_modal.choose_the_size_for">Choose the size for the blank page.</p>
+
+    <!-- Size options -->
+    <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+      <!-- Match reference page — always first and default -->
+      <label id="insert-size-match-lbl" style="display:flex;align-items:center;gap:12px;padding:10px 14px;border:2px solid var(--accent);border-radius:8px;cursor:pointer;background:rgba(232,255,87,.06)">
+        <input type="radio" name="insert-size" value="match" checked style="accent-color:var(--accent);width:15px;height:15px">
+        <div>
+          <div style="font-size:13px;font-weight:600" data-i18n="insert_size_match_lbl.match_selected_page">Match selected page</div>
+          <div id="insert-match-dims" style="font-size:11px;color:var(--text-dim);margin-top:1px"></div>
+        </div>
+      </label>
+
+      <!-- Preset grid -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="a4p" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.a4_portrait">A4 Portrait</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="a4l" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.a4_landscape">A4 Landscape</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="a3p" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.a3_portrait">A3 Portrait</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="ltp" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.letter_portrait">Letter Portrait</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="ltl" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.letter_landscape">Letter Landscape</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="legal" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.legal_portrait">Legal Portrait</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--border);border-radius:7px;cursor:pointer">
+          <input type="radio" name="insert-size" value="custom" style="accent-color:var(--accent);width:14px;height:14px">
+          <span style="font-size:13px" data-i18n="insert_blank_modal.custom">Custom&hellip;</span>
+        </label>
+      </div>
+
+      <!-- Custom size inputs -->
+      <div id="insert-custom-row" style="display:none;align-items:center;gap:8px;padding:10px 14px;background:var(--surface2);border-radius:7px;font-size:13px;color:var(--text-dim)">
+        <span data-i18n="insert_custom_row.width">Width</span>
+        <input id="insert-custom-w" type="number" value="210" min="10" max="2000"
+               style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:5px 7px;font-size:13px">
+        <span>×</span>
+        <input id="insert-custom-h" type="number" value="297" min="10" max="2000"
+               style="width:70px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:5px 7px;font-size:13px">
+        <span data-i18n="insert_custom_row.mm">mm</span>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="closeInsertBlankModal()" data-i18n="insert_blank_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="doInsertBlank()" data-i18n="insert_blank_modal.insert">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Insert
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Compress Modal -->
+<div id="compress-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center" onclick="if(event.target===this)hideCompress()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:430px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="font-size:16px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px" data-i18n="compress_modal.compress_pdf">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="10" y1="20" x2="21" y2="9"/><line x1="3" y1="15" x2="14" y2="4"/></svg>
+      Compress PDF
+    </div>
+    <p style="font-size:13px;color:var(--text-dim);margin-bottom:18px;line-height:1.6" data-i18n="compress_modal.re_renders_every_page">Shrinks the pictures inside each page to a lower resolution. Text and drawings are left as they are, so pages stay sharp and searchable. Best for PDFs with high-resolution images, such as those from Word/Excel.</p>
+    <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:18px">
+      <div style="font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:10px" data-i18n="compress_modal.quality_preset">
+        Quality preset
+        <select id="compress-preset" onchange="updateCompressPreset()" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:13px;flex:1">
+          <option value="screen" data-i18n="compress_preset.screen_96_dpi_smallest">Screen — 96 dpi, smallest file</option>
+          <option value="ebook" selected data-i18n="compress_preset.balanced_150_dpi_good">Balanced — 150 dpi, good quality</option>
+          <option value="print" data-i18n="compress_preset.print_200_dpi_high">Print — 200 dpi, high quality</option>
+          <option value="custom" data-i18n="compress_preset.custom">Custom…</option>
+        </select>
+      </div>
+      <div id="compress-custom" style="display:none;flex-direction:column;gap:10px">
+        <div style="font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px">
+          <span style="width:90px" data-i18n="compress_custom.resolution">Resolution</span>
+          <input type="range" id="compress-dpi" min="72" max="300" value="150" oninput="document.getElementById('compress-dpi-val').textContent=this.value" style="flex:1">
+          <span id="compress-dpi-val" style="font-family:monospace;width:36px;text-align:right">150</span><span style="font-size:12px" data-i18n="compress_custom.dpi"> dpi</span>
+        </div>
+        <div style="font-size:13px;color:var(--text-dim);display:flex;align-items:center;gap:8px">
+          <span style="width:90px" data-i18n="compress_custom.jpeg_quality">JPEG quality</span>
+          <input type="range" id="compress-quality" min="10" max="95" value="60" oninput="document.getElementById('compress-q-val').textContent=this.value" style="flex:1">
+          <span id="compress-q-val" style="font-family:monospace;width:36px;text-align:right">60</span><span style="font-size:12px">%</span>
+        </div>
+      </div>
+      <div id="compress-scan-warn" style="display:none;font-size:12px;color:#ffc857;background:rgba(255,200,87,0.1);border:1px solid rgba(255,200,87,0.25);border-radius:6px;padding:8px 12px;line-height:1.5" data-i18n="compress_scan_warn.this_document_may_contain">
+        ⚠ This document may contain scanned pages. Compression will reduce text sharpness — consider using the Print preset (200 dpi) or higher.
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="hideCompress()" data-i18n="compress_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="doCompress()" data-i18n="compress_modal.compress_all_pages">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/></svg>
+        Compress All Pages
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Export As Modal -->
+<div id="export-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center" onclick="if(event.target===this)hideExportModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:400px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.5)">
+    <div style="font-size:16px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:8px" data-i18n="export_modal.export_as">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Export As
+    </div>
+    <p style="font-size:13px;color:var(--text-dim);margin-bottom:20px;line-height:1.6" data-i18n="export_modal.export_every_page_to">Export every page to the chosen format. Word can extract editable text and images from native PDFs and OCR text from scanned pages; anything else falls back to a full-page image.</p>
+    <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:22px">
+      <label style="display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;cursor:pointer;transition:border-color 0.15s" id="export-opt-word" onclick="selectExportFmt('word')">
+        <input type="radio" name="export-fmt" value="word" checked style="accent-color:var(--accent);width:15px;height:15px">
+        <div>
+          <div style="font-size:14px;font-weight:600" data-i18n="export_opt_word.word_document">Word Document</div>
+          <div style="font-size:12px;color:var(--text-dim);margin-top:2px" data-i18n="export_opt_word.desc">.docx — editable text &amp; images from native PDFs</div>
+        </div>
+      </label>
+      <label style="display:flex;align-items:center;gap:12px;padding:12px 14px;border:1px solid var(--border);border-radius:8px;cursor:pointer;transition:border-color 0.15s" id="export-opt-excel" onclick="selectExportFmt('excel')">
+        <input type="radio" name="export-fmt" value="excel" style="accent-color:var(--accent);width:15px;height:15px">
+        <div>
+          <div style="font-size:14px;font-weight:600" data-i18n="export_opt_excel.excel_spreadsheet">Excel Spreadsheet</div>
+          <div style="font-size:12px;color:var(--text-dim);margin-top:2px" data-i18n="export_opt_excel.xlsx_tables_desc">.xlsx — finds tables in the document, one per sheet tab</div>
+        </div>
+      </label>
+    </div>
+    <label id="export-editable-row" style="display:flex;align-items:flex-start;gap:10px;padding:11px 14px;margin-bottom:22px;border:1px dashed var(--border);border-radius:8px;cursor:pointer">
+      <input type="checkbox" id="export-editable" checked style="accent-color:var(--accent);width:15px;height:15px;margin-top:2px">
+      <div>
+        <div style="font-size:13px;font-weight:600" data-i18n="export_editable_row.editable_text_where_possible">Editable text (where possible)</div>
+        <div style="font-size:11px;color:var(--text-dim);margin-top:2px" data-i18n="export_editable_row.extract_editable_text_and">Extract editable text and embedded images from native PDF pages, and OCR text from scanned pages. Turn off to embed every page as an image.</div>
+      </div>
+    </label>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="hideExportModal()" data-i18n="export_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="doExport()" data-i18n="export_modal.choose_location">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Choose Location…
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Header / Footer Modal -->
+<div id="hf-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center" onclick="if(event.target===this)hideHFModal()">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:28px;max-width:560px;width:95%;box-shadow:0 24px 64px rgba(0,0,0,.5);max-height:90vh;overflow-y:auto">
+    <div style="font-size:16px;font-weight:600;margin-bottom:6px;display:flex;align-items:center;gap:8px" data-i18n="hf_modal.header_footer_title">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="5" x2="21" y2="5"/><line x1="3" y1="19" x2="21" y2="19"/><rect x="3" y="8" width="18" height="8" rx="1"/></svg>
+      Header &amp; Footer
+    </div>
+    <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.5" data-i18n="hf_modal.tokens">Tokens: <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:11px">{page}</code> <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:11px">{total}</code> <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:11px">{date}</code> <code style="background:var(--surface2);padding:1px 5px;border-radius:3px;font-size:11px">{filename}</code></p>
+
+    <!-- Header row -->
+    <div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px" data-i18n="hf_modal.header">Header</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:16px">
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.left">Left</div>
+        <input id="hf-h-left" type="text" placeholder="e.g. {filename}" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px" data-i18n-attr="placeholder:hf_h_left.e_g_filename_ph">
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.centre">Centre</div>
+        <input id="hf-h-centre" type="text" placeholder="e.g. My Company" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px" data-i18n-attr="placeholder:hf_h_centre.e_g_my_company_ph">
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.right">Right</div>
+        <input id="hf-h-right" type="text" placeholder="e.g. {date}" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px" data-i18n-attr="placeholder:hf_h_right.e_g_date_ph">
+      </div>
+    </div>
+
+    <!-- Footer row -->
+    <div style="font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px" data-i18n="hf_modal.footer">Footer</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:18px">
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.left">Left</div>
+        <input id="hf-f-left" type="text" placeholder="" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px">
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.centre">Centre</div>
+        <input id="hf-f-centre" type="text" placeholder="Page {page} of {total}" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px" data-i18n-attr="placeholder:hf_f_centre.page_page_of_total_ph">
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px" data-i18n="hf_modal.right">Right</div>
+        <input id="hf-f-right" type="text" placeholder="" style="width:100%;box-sizing:border-box;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px">
+      </div>
+    </div>
+
+    <!-- Style controls -->
+    <div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:18px;align-items:center">
+      <div style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text-dim)" data-i18n="hf_modal.font">
+        Font
+        <select id="hf-font" style="background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
+          <option value="Helvetica" data-i18n="hf_font.helvetica">Helvetica</option>
+          <option value="Times-Roman" data-i18n="hf_font.times_roman">Times Roman</option>
+          <option value="Courier" data-i18n="hf_font.courier">Courier</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text-dim)" data-i18n="hf_modal.size">
+        Size
+        <input id="hf-size" type="number" value="10" min="6" max="24" style="width:54px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
+        <span style="font-size:12px" data-i18n="hf_modal.pt">pt</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text-dim)" data-i18n="hf_modal.colour">
+        Colour
+        <input id="hf-color" type="color" value="#000000" style="width:36px;height:28px;border:1px solid var(--border);border-radius:6px;background:var(--surface2);cursor:pointer;padding:2px">
+      </div>
+      <div style="display:flex;align-items:center;gap:7px;font-size:13px;color:var(--text-dim)" data-i18n="hf_modal.margin">
+        Margin
+        <input id="hf-margin" type="number" value="18" min="4" max="80" style="width:54px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
+        <span style="font-size:12px" data-i18n="hf_modal.pt">pt</span>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="hideHFModal()" data-i18n="hf_modal.cancel">Cancel</button>
+      <button class="btn btn-accent" onclick="applyHeaderFooter()" data-i18n="hf_modal.apply_to_all_pages">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="3" y1="5" x2="21" y2="5"/><line x1="3" y1="19" x2="21" y2="19"/><rect x="3" y="8" width="18" height="8" rx="1"/></svg>
+        Apply to All Pages
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Loading Overlay removed -->
+
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     EDITOR PANEL
+════════════════════════════════════════════════════════ -->
+
+<!-- ── Shared: loading overlay + toast ── -->
+<div id="loading-overlay" role="status" aria-live="polite" aria-busy="true">
+  <div class="spinner"></div>
+  <div class="loading-text" id="loading-text" data-i18n="loading_text.loading">Loading&hellip;</div>
+</div>
+
+<div id="toast" role="status"><div class="toast-dot"></div><span id="toast-msg"></span></div>
+
+<!-- Persistent off-screen live region — showToast()/showLoading() mirror their
+     message here so screen readers announce saves, errors and progress even when
+     the visual element is display:none. -->
+<div id="sr-status" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+<!-- About Modal — lives in shared area so it works from any panel -->
+<!-- File dropdown — ONE shared instance for all three toolbars.  It lives
+     outside every .app-panel because a position:fixed menu inside a
+     display:none panel is invisible, and Layout / Editor open it too. -->
+  <div id="file-menu" role="menu" aria-label="File" data-i18n-attr="aria-label:file_menu.file_aria">
+    <div class="menu-item" role="menuitem" data-action="new" onclick="fileMenuAction('new')">
+      <span class="mi-left" data-i18n="file_menu.new_document">New document</span><span class="menu-shortcut">Ctrl+N</span>
+    </div>
+    <div class="menu-item" role="menuitem" data-action="open" onclick="fileMenuAction('open')">
+      <span class="mi-left" data-i18n="file_menu.open">Open…</span><span class="menu-shortcut">Ctrl+O</span>
+    </div>
+    <div class="menu-item" role="menuitem" data-action="save" data-needs-doc onclick="fileMenuAction('save')">
+      <span class="mi-left" data-i18n="file_menu.save">Save…</span><span class="menu-shortcut">Ctrl+S</span>
+    </div>
+    <div class="menu-item" role="menuitem" data-action="close" data-needs-tabs onclick="fileMenuAction('close')">
+      <span class="mi-left" data-i18n="file_menu.close_tab">Close tab</span><span class="menu-shortcut">Ctrl+W</span>
+    </div>
+    <div class="menu-divider"></div>
+    <div class="menu-item" role="menuitem" data-action="print" data-needs-doc onclick="fileMenuAction('print')">
+      <span class="mi-left" data-i18n="file_menu.print">Print…</span><span class="menu-shortcut">Ctrl+P</span>
+    </div>
+    <div class="menu-divider"></div>
+    <!-- Document-level, not a panel tool: it rewrites every page at once and so
+         cannot join the per-page undo history (see the merge plan, §3.5). -->
+    <div class="menu-item" role="menuitem" data-action="watermark-all" data-needs-doc onclick="fileMenuAction('watermark-all')">
+      <span class="mi-left" data-i18n="file_menu.watermark_all">Watermark every page…</span>
+    </div>
+    <div class="menu-divider"></div>
+    <div class="menu-label" data-i18n="file_menu.recent_files">Recent files</div>
+    <div id="file-menu-recent"></div>
+  </div>
+  <!-- Hidden input: browser-mode fallback for Open (native app uses an OS dialog) -->
+  <input type="file" id="viewer-file-input" multiple
+         accept=".pdf,.doc,.docx,.odt,.rtf,.xls,.xlsx,.ods,.csv,.txt,.png,.jpg,.jpeg,.gif,.bmp,.tif,.tiff,.webp"
+         style="display:none" onchange="_viewerFileInputChange(event)">
+
+<div id="about-modal" onclick="if(event.target===this)closeAbout()">
+  <div class="about-box" role="dialog" aria-modal="true" aria-labelledby="about-title">
+    <div class="about-logo-mark">
+      <img src="/favicon.ico" alt="Patchwork PDF" style="width:64px;height:64px;object-fit:contain">
+    </div>
+    <div class="about-title" id="about-title">Patchwork<span>PDF</span></div>
+    <div class="about-version" id="about-version">Version &mdash; 2026</div>
+    <div class="about-body" id="about-description">
+      <span data-i18n="about_description.tagline">A lightweight PDF editor for merging, reordering, rotating and editing PDF pages.</span><br><br>
+      <span data-i18n="about_description.built_with">Built with</span> <strong data-i18n="about_description.python">Python</strong>, <strong data-i18n="about_description.flask">Flask</strong>, <strong data-i18n="about_description.pypdf">pypdf</strong> <span data-i18n="about_description.and">and</span> <strong data-i18n="about_description.pypdfium2">pypdfium2</strong>.
+    </div>
+    <div class="about-divider"></div>
+    <div class="about-credit" data-i18n="about_modal.written_by">Written by <strong id="about-publisher">Gareth Finch</strong> &mdash; <span id="about-year">2026</span></div>
+    <br>
+    <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-bottom:10px">
+      <button class="btn btn-ghost" onclick="openBundledFile('PatchworkPDF_Manual.pdf')" title="Open the user manual" data-i18n="about_modal.manual" data-i18n-attr="title:about_modal.open_the_user_manual_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+        Manual
+      </button>
+      <button class="btn btn-ghost" onclick="closeAbout(); showWhatsNew()" title="What changed in this version" data-i18n="about_modal.whats_new" data-i18n-attr="title:about_modal.whats_new_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+        What's New
+      </button>
+      <button class="btn btn-ghost" onclick="openBundledFile('changelog.docx')" title="View the changelog" data-i18n="about_modal.changelog" data-i18n-attr="title:about_modal.view_the_changelog_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        Changelog
+      </button>
+      <button id="about-check-updates-btn" class="btn btn-ghost" onclick="checkForUpdatesManual()" title="Check online for a newer version" data-i18n="about_modal.check_updates" data-i18n-attr="title:about_modal.check_updates_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/></svg>
+        Check for Updates
+      </button>
+      <button class="btn btn-ghost" onclick="showLicense()" title="View the usage license" data-i18n="about_modal.license" data-i18n-attr="title:about_modal.view_the_usage_license_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 15a7 7 0 1 0 0-14 7 7 0 0 0 0 14z"/><path d="M8.21 13.89 7 23l5-3 5 3-1.21-9.12"/></svg>
+        License
+      </button>
+      <button class="btn btn-ghost" onclick="closeAbout();openShortcutsOverlay()" title="View keyboard shortcuts (?)" data-i18n="about_modal.shortcuts" data-i18n-attr="title:about_modal.view_keyboard_shortcuts_tip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h.01M18 14h.01M9 14h6"/></svg>
+        Shortcuts
+      </button>
+      <button class="btn btn-accent" onclick="closeAbout()" data-i18n="about_modal.close">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Keyboard Shortcuts Modal — shared; opens from any panel via the ? key or a
+     help button. Body is rendered by _renderShortcuts() from the SHORTCUTS data. -->
+<div id="shortcuts-modal" onclick="if(event.target===this)closeShortcutsOverlay()">
+  <div class="sc-box" role="dialog" aria-modal="true" aria-labelledby="sc-title">
+    <div class="sc-head">
+      <div class="sc-title" id="sc-title" data-i18n="sc_title.keyboard_shortcuts">Keyboard shortcuts</div>
+      <button class="btn btn-ghost btn-icon" id="sc-close" onclick="closeShortcutsOverlay()" title="Close (Esc)" aria-label="Close keyboard shortcuts" data-i18n-attr="title:sc_close.close_esc_tip;aria-label:sc_close.close_keyboard_shortcuts_aria">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="sc-grid" id="sc-grid"></div>
+    <div class="sc-foot"><span data-i18n="sc_foot.press">Press</span> <kbd>?</kbd> <span data-i18n="sc_foot.open_list">anytime to open this list</span> &middot; <kbd>Ctrl</kbd><kbd>K</kbd> <span data-i18n="sc_foot.for_palette">for the command palette</span></div>
+  </div>
+</div>
+
+<!-- Command Palette — shared; Ctrl/Cmd+K. List is rendered by _cpRender() from
+     the COMMANDS registry, scoped to the active panel. -->
+<div id="command-palette" onclick="if(event.target===this)closeCommandPalette()">
+  <div class="cp-box" role="dialog" aria-modal="true" aria-label="Command palette" data-i18n-attr="aria-label:command_palette.command_palette_aria">
+    <div class="cp-input-wrap">
+      <svg class="cp-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input id="cp-input" type="text" placeholder="Search actions…" autocomplete="off" spellcheck="false"
+             role="combobox" aria-controls="cp-list" aria-expanded="true"
+             oninput="_cpOnInput()" onkeydown="_cpOnKey(event)" data-i18n-attr="placeholder:cp_input.search_actions_ph">
+    </div>
+    <div class="cp-list" id="cp-list" role="listbox"></div>
+    <div class="cp-foot">
+      <span data-i18n="command_palette.navigate"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span data-i18n="command_palette.run"><kbd>↵</kbd> run</span>
+      <span data-i18n="command_palette.close"><kbd>Esc</kbd> close</span>
+    </div>
+  </div>
+</div>
+
+<!-- License Modal — opened from the About box, and shown as a blocking
+     acceptance dialog on first run (Accept button replaces Close). -->
+<!-- Run-once "What's New": v3.1 moved the editor's tools into the viewer and
+     removed the Editor button.  Shown once per version, and never to a user who
+     has never seen the old layout.  Re-openable from About.
+     NOTE: every translated element here holds ONE plain text run.  i18n.js sets
+     textContent, so inline markup inside a data-i18n element is escaped and
+     duplicated — put emphasis in its own element or leave it out. -->
+<div id="whats-new-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10003;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px 24px 18px;max-width:520px;width:92%;box-shadow:0 24px 64px rgba(0,0,0,.5);max-height:82vh;overflow-y:auto">
+    <div style="font-size:16px;font-weight:600;margin-bottom:4px;color:var(--text)" data-i18n="whats_new.title">What's new in this version</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px" data-i18n="whats_new.subtitle">Version 3.3 opens faster and uses less memory.</div>
+
+    <div style="font-size:13px;color:var(--text);line-height:1.65">
+      <ul style="margin:0 0 14px 18px;padding:0">
+        <li data-i18n="whats_new.v33_item_speed">Faster start-up, especially when you double-click a PDF to open it.</li>
+        <li data-i18n="whats_new.v33_item_memory">Uses much less memory: up to around 700 MB less on PCs with many processor cores.</li>
+        <li data-i18n="whats_new.v33_item_size">A smaller download: unused components have been removed.</li>
+        <li data-i18n="whats_new.v33_item_theme">Light or dark mode and your language are now remembered every time you start the app.</li>
+        <li data-i18n="whats_new.v33_item_relaunch">Opening a PDF just after closing the app no longer says it is already running.</li>
+        <li data-i18n="whats_new.v33_item_linux">Linux: Export to Word works again.</li>
+      </ul>
+      <!-- The 3.2 note stays, for anyone skipping straight from 3.1 or earlier. -->
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:0 0 6px" data-i18n="whats_new.v32_heading">From version 3.2: the Tools panel on the right has been reorganised.</div>
+      <p style="margin:0 0 6px" data-i18n="whats_new.body_1">
+        Its tools are now on three tabs, by what they do to your document:
+      </p>
+      <ul style="margin:0 0 12px 18px;padding:0">
+        <li data-i18n="whats_new.item_comment">Comment — sticky notes, text, highlights and shapes that sit on top of the page. Everything you add is listed under the tools.</li>
+        <li data-i18n="whats_new.item_edit">Edit — change the document itself: edit its text, add text or an image, redact, watermark and crop.</li>
+        <li data-i18n="whats_new.item_sign">Fill &amp; Sign — add form fields and sign.</li>
+      </ul>
+      <p style="margin:0 0 12px" data-i18n="whats_new.body_3">
+        The comments list shows who added each item and when. You can reply, set a status such as Accepted or Rejected, and filter by type, author or status. Put your name at the top of the Comment tab.
+      </p>
+      <p style="margin:0 0 12px" data-i18n="whats_new.body_2">
+        Coming from a version before 3.1? There is no separate Editor any more: its tools are on the Edit tab, changes apply straight away, and Ctrl+Z undoes them.
+      </p>
+      <p style="margin:0;color:var(--text-dim)" data-i18n="whats_new.body_4">
+        You can read this again at any time from About.
+      </p>
+    </div>
+
+    <div style="display:flex;justify-content:flex-end;margin-top:18px">
+      <button class="btn btn-accent" onclick="closeWhatsNew()" data-i18n="whats_new.got_it">Got it</button>
+    </div>
+  </div>
+</div>
+
+<div id="license-modal" onclick="if(event.target===this)closeLicense()">
+  <div class="license-box">
+    <div class="license-title" data-i18n="license_modal.usage_license">Patchwork PDF &mdash; Usage License</div>
+    <div class="license-firstrun-note" id="license-firstrun-note" style="display:none">
+      <span data-i18n="license_firstrun_note.intro">Welcome to Patchwork PDF. Before you start, please read the usage license below and click</span> <strong data-i18n="license_firstrun_note.accept">I&nbsp;Accept</strong> <span data-i18n="license_firstrun_note.to_continue">to continue.</span>
+    </div>
+    <div class="license-text" id="license-text">Loading&hellip;</div>
+    <div class="license-actions">
+      <button class="btn btn-accent" id="license-accept-btn" onclick="acceptLicense()" style="display:none" data-i18n="license_accept_btn.i_accept">I Accept</button>
+      <button class="btn btn-ghost" id="license-close-btn" onclick="closeLicense()" data-i18n="license_close_btn.close">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- Update Available Modal — shown on startup when a newer release is published
+     on SourceForge (see _checkForUpdates in layout.js). -->
+<div id="update-modal" onclick="if(event.target===this)closeUpdateModal()">
+  <div class="update-box" role="dialog" aria-modal="true" aria-labelledby="update-title">
+    <div class="update-head">
+      <svg class="update-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/></svg>
+      <div>
+        <div class="update-title" id="update-title" data-i18n="update_title.update_available">Update available</div>
+        <div class="update-sub" id="update-sub"></div>
+      </div>
+    </div>
+    <div class="update-notes-label" id="update-notes-label" data-i18n="update_modal.what_s_new">What's new</div>
+    <div class="update-notes" id="update-notes"></div>
+    <label class="update-optout" data-i18n="update_modal.dont_notify">
+      <input type="checkbox" id="update-optout-cb">
+      Don&rsquo;t notify me about future updates
+    </label>
+    <div class="update-actions">
+      <button id="update-later-btn" class="btn btn-ghost" onclick="closeUpdateModal()" data-i18n="update_modal.later">Later</button>
+      <button id="update-download-btn" class="btn btn-accent" onclick="openUpdateDownload()" data-i18n="update_modal.download">Download</button>
+    </div>
+  </div>
+</div>
+
+
+
+
+<script src="/shared.js"></script>
+<script src="/layout.js"></script>
+<script src="/viewer-panel.js"></script>
+
+</body>
+</html>
