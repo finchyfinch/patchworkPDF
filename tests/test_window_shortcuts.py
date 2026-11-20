@@ -21,11 +21,16 @@ import _bootstrap  # noqa: F401
 import pytest
 
 import entry
-from platform_io import win_chrome, win_shortcuts
+# win_shortcuts is safe to import anywhere (it does nothing off Windows);
+# win_chrome is Windows-only at import time (ctypes.WINFUNCTYPE), so it is
+# imported inside the Windows-only tests — importing it here broke collection
+# of the whole suite on macOS and Linux (v3.4 release builds).
+from platform_io import win_shortcuts
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows focus path')
 def test_focus_uses_webview2_movefocus_before_raw_setfocus(monkeypatch):
+    from platform_io import win_chrome
     calls = []
     monkeypatch.setattr(win_shortcuts, 'focus_page', lambda w: calls.append(w) or True)
     monkeypatch.setattr(win_chrome, '_hwnd_of',
@@ -36,6 +41,7 @@ def test_focus_uses_webview2_movefocus_before_raw_setfocus(monkeypatch):
 
 @pytest.mark.skipif(sys.platform != 'win32', reason='Windows focus path')
 def test_raw_setfocus_remains_the_fallback(monkeypatch):
+    from platform_io import win_chrome
     monkeypatch.setattr(win_shortcuts, 'focus_page', lambda w: False)
     monkeypatch.setattr(win_chrome, '_hwnd_of', lambda w: None)
     assert win_chrome.focus_web_content('W') is False      # reached the old path
