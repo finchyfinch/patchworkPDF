@@ -47,7 +47,7 @@ jobs:
         include:
           - runner: macos-15-intel   # x86_64
             label: Intel
-          - runner: macos-14         # arm64
+          - runner: macos-15         # arm64 (macos-14 image retired by GitHub, Nov 2026)
             label: AppleSilicon
     runs-on: ${{ matrix.runner }}
     steps:
