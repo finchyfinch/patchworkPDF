@@ -783,6 +783,65 @@ def register_layout_routes(app, sessions, inject_token=None):
         _recovery.mark_meta_dirty(session)     # drops the page from the manifest
         return jsonify({'success': True})
 
+    @app.route('/api/split_from', methods=['POST'])
+    def split_from():
+        """Split the document at a page: that page and every later one leave
+        this session and become a NEW, unsaved document (its own session), which
+        the client opens in a new tab.  Layout's "Split document from here".
+
+        Body: {session_id, page_id}.  Splitting at the first page is refused —
+        it would leave the original with no pages, which is a move, not a split.
+
+        The pages are MOVED, records and all, so anything riding on them
+        (filled form values, the OCR stash, covered-text bookkeeping) goes with
+        them.  Bookmarks follow their page.  Undo/redo entries for the moved
+        pages are dropped from the original: they name pages it no longer has.
+        """
+        data       = request.json or {}
+        session_id = data.get('session_id', '')
+        page_id    = data.get('page_id', '')
+        session    = sessions.get(session_id)
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+        with get_session_lock(session):
+            pages = session.get('pages') or []
+            idx = next((i for i, p in enumerate(pages) if p['id'] == page_id), None)
+            if idx is None:
+                return jsonify({'error': 'Page not found'}), 404
+            if idx == 0:
+                return jsonify({'error': 'Cannot split at the first page',
+                                'error_key': 'err.split_first_page'}), 400
+            moved = pages[idx:]
+            moved_ids = {p['id'] for p in moved}
+            session['pages'] = pages[:idx]
+            bms = session.get('bookmarks') or []
+            session['bookmarks'] = [b for b in bms if b.get('page_id') not in moved_ids]
+            new_bms = [b for b in bms if b.get('page_id') in moved_ids]
+            for key in ('annot_undo', 'annot_redo'):
+                if session.get(key):
+                    session[key] = [e for e in session[key] if e[0] not in moved_ids]
+        # Its own name, so the tab says which part it is and Save never offers
+        # to overwrite the original file.
+        stem, ext = os.path.splitext(os.path.basename(str(moved[0].get('filename') or 'Document')))
+        part_name = '%s (from page %d)%s' % (stem, idx + 1, ext or '.pdf')
+        for p in moved:
+            p['filename'] = part_name
+        new_sid = str(uuid.uuid4())
+        sessions[new_sid] = {
+            'pages':           moved,
+            'first_file_path': None,          # unsaved: Save asks where
+            'comments':        {},
+            'bookmarks':       new_bms,
+            'metadata':        dict(session.get('metadata') or {}),
+        }
+        _recovery.mark_meta_dirty(session)
+        _recovery.mark_dirty(sessions[new_sid])   # snapshot every page of the new doc
+        logger.info('[split_from] %s at page %d -> new session %s (%d pages)',
+                    session_id, idx + 1, new_sid, len(moved))
+        return jsonify({'success': True, 'session_id': new_sid,
+                        'page_id': moved[0]['id'], 'moved': len(moved),
+                        'remaining': len(session['pages'])})
+
     @app.route('/api/insert_blank_page', methods=['POST'])
     def insert_blank_page():
         """Insert a blank white page before or after a reference page.

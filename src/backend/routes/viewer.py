@@ -89,6 +89,7 @@ import base64
 import re as _re
 import uuid
 import logging
+import time
 
 import pypdf as _pypdf
 from flask import request, jsonify, Response
@@ -4721,7 +4722,7 @@ def register_viewer_routes(app, sessions, inject_token=None):
     # session lock holds across the whole handler, so the IDs the client quotes
     # still refer to the same runs.
 
-    def _page_elements(pdf_bytes, page_rec=None):
+    def _page_elements(pdf_bytes, page_rec=None, progress_cb=None):
         """(text_items, page_top, page_left) for a page, using the editor's own
         extraction and origin rules so both panels agree on what a run is.
 
@@ -4740,7 +4741,8 @@ def register_viewer_routes(app, sessions, inject_token=None):
         # the current ones — otherwise the first edit hides the rest of the
         # page from the Pointer.  See _preserve_ocr_source.
         _w, page_h, _pt, _pb, text_items, _gi = _extract_text_and_graphics(
-            pdf_bytes, _ocr_source_for(pdf_bytes, page_rec))
+            pdf_bytes, _ocr_source_for(pdf_bytes, page_rec),
+            progress_cb=progress_cb)
         if page_rec is not None:
             text_items = _filter_covered_text_items(
                 text_items,
@@ -4850,11 +4852,48 @@ def register_viewer_routes(app, sessions, inject_token=None):
         pdf_bytes, rec = _pdf_bytes_from_session(session, data.get('page_id', ''))
         if not pdf_bytes:
             return jsonify({'error': 'Page not found'}), 404
+        # "Read text in images" (v3.4): OCR a NATIVE page too, for text that
+        # only exists as pixels — a screenshot or a scanned logo on an
+        # otherwise native page.  The old Editor's Force OCR replaced the
+        # page's real text with OCR words; this keeps every native run and
+        # only ADDS the OCR words that are not under one.  It works by giving
+        # the page an OCR source (its current bytes), which is exactly how an
+        # edited scan is handled: _ocr_source_for → _extract_text_and_graphics'
+        # mixed branch → _drop_ocr_under_native.  Session-only, like the scan
+        # stash; a crop retires it (_ocr_source_for's size check).
+        if data.get('read_images'):
+            from routes import editor as _ed
+            if not _ed._OCR_AVAILABLE:
+                return jsonify({'error': 'OCR is not available',
+                                'error_key': 'err.ocr_unavailable'}), 400
+            if rec is not None and not rec.get('ocr_source_bytes'):
+                rec['ocr_source_bytes'] = pdf_bytes
+                logger.info('[READ_IMAGES] page %s: OCR source set', data.get('page_id', ''))
+        # A scanned page is OCR'd here, which is seconds on a slow machine:
+        # report the stages under progress_id so the client's loading overlay
+        # shows them instead of the app looking frozen.  A native page (or a
+        # cached OCR) reports nothing, so the overlay never flashes.
+        progress_id = data.get('progress_id', '')
+
+        def _pcb(cur, total, label):
+            set_progress(progress_id, cur, total, label)
+
+        _t = time.perf_counter()
         try:
-            items, page_top, page_left = _page_elements(pdf_bytes, rec)
+            items, page_top, page_left = _page_elements(pdf_bytes, rec,
+                                                        progress_cb=_pcb)
         except Exception as exc:
             logger.exception('[viewer_page_elements] extraction failed')
             return jsonify({'error': str(exc)}), 500
+        finally:
+            clear_progress(progress_id)
+        # One line per Pointer load, so a "the first click takes ages" report
+        # can be read straight off the log: a slow line with an [OCR_TIMING]
+        # just above it is OCR; a slow line without one is not.
+        logger.info('[ET_LOAD] page=%s items=%d ocr=%s took=%.2fs',
+                    data.get('page_id', ''), len(items),
+                    any(t.get('ocr') for t in items),
+                    time.perf_counter() - _t)
         # Only what the overlay needs: geometry, the words, and the style the
         # panel shows when a run is selected.
         slim = [{'id': t.get('id'), 'text': t.get('text', ''),
@@ -4862,12 +4901,21 @@ def register_viewer_routes(app, sessions, inject_token=None):
                  'x2': t.get('x2'), 'y2': t.get('y2'),
                  'size': t.get('size'), 'font_size': t.get('font_size'),
                  'color': t.get('color', '#000000'),
-                 'rl_font': t.get('rl_font', 'Helvetica')}
+                 'rl_font': t.get('rl_font', 'Helvetica'),
+                 # The document's own font name (pdfium's), so the panel can
+                 # say what the words are actually set in.
+                 'font': (t.get('font') if t.get('font') not in (None, 'unknown')
+                          else None)}
                 for t in items
                 if t.get('type') == 'text' and not t.get('deleted')
                 and t.get('x') is not None]
+        # Whether the panel should offer "Read text in images": OCR exists,
+        # and nothing on this page is OCR'd yet (a scan, or already read).
+        from routes import editor as _ed
+        ocr_words = sum(1 for t in items if t.get('ocr'))
         return jsonify({'items': slim, 'page_top': page_top,
-                        'page_left': page_left})
+                        'page_left': page_left, 'ocr_words': ocr_words,
+                        'can_read_images': bool(_ed._OCR_AVAILABLE) and ocr_words == 0})
 
     @app.route('/api/viewer/edit_text', methods=['POST'])
     @_serialised_on_session
@@ -4933,7 +4981,10 @@ def register_viewer_routes(app, sessions, inject_token=None):
             try:
                 edits['moved'] = [{'id': el_id,
                                    'x': float(data['x']) + dx,
-                                   'y': float(data['y']) + dy}]
+                                   'y': float(data['y']) + dy,
+                                   # moving re-sets the words: keep them in
+                                   # the document's own font when it can.
+                                   '_keep_native': True}]
             except (KeyError, TypeError, ValueError):
                 return jsonify({'error': 'Bad move'}), 400
         elif op in ('text', 'style'):
@@ -4949,8 +5000,14 @@ def register_viewer_routes(app, sessions, inject_token=None):
                 if data.get('color') and _re.fullmatch(r'#[0-9a-fA-F]{6}',
                                                        str(data['color'])):
                     ch['color'] = data['color']
+                # No font asked for → set the new words in the DOCUMENT'S own
+                # font where it has the glyphs (apply_edits' _NativeFont); the
+                # mapped bundled face is only the fallback.  Choosing a font
+                # or weight in the panel sends rl_font and opts out.
                 if data.get('rl_font'):
                     ch['rl_font'] = str(data['rl_font'])
+                else:
+                    ch['_keep_native'] = True
                 if data.get('size'):
                     try:
                         ch['size'] = max(4.0, min(400.0, float(data['size'])))

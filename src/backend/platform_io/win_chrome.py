@@ -287,6 +287,16 @@ def focus_web_content(window):
     old behaviour."""
     if sys.platform != 'win32':
         return False
+    # WebView2's own API first (v3.4).  Raw SetFocus below makes Windows REPORT
+    # focus on the page without updating WebView2's internal focus, and the
+    # next key is silently dropped — the root of years of "Ctrl+P does nothing
+    # after a dialog".  See win_shortcuts.focus_page.
+    try:
+        from platform_io import win_shortcuts
+        if win_shortcuts.focus_page(window):
+            return True
+    except Exception:
+        pass
     hwnd = _hwnd_of(window)
     if hwnd is None:
         return False

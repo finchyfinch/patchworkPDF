@@ -543,7 +543,7 @@ function _setActivePanel(panelId) {
 // true when a document is available afterwards, false when there genuinely
 // isn't one.  Safe to call repeatedly — it is a no-op once the viewer is
 // already on that session.
-async function adoptLayoutDocument() {
+async function adoptLayoutDocument(atPageId) {
   const layoutSid = (typeof sessionId !== 'undefined') ? sessionId : null;
   const alreadyOurs = SESSION_ID && (!layoutSid || layoutSid === SESSION_ID);
   if (alreadyOurs && typeof allPages !== 'undefined' && allPages.length) return true;
@@ -552,10 +552,10 @@ async function adoptLayoutDocument() {
   }
 
   SESSION_ID    = layoutSid;
-  currentPageId = '';
+  currentPageId = (typeof atPageId === 'string') ? atPageId : '';
   if (typeof _tabs !== 'undefined' && _tabs[_activeTabIdx]) {
     _tabs[_activeTabIdx].session_id = SESSION_ID;
-    _tabs[_activeTabIdx].page_id    = '';
+    _tabs[_activeTabIdx].page_id    = currentPageId;
   }
   if (typeof _resetViewerState === 'function') _resetViewerState();
   if (typeof loadPageList === 'function') {
@@ -571,12 +571,21 @@ async function adoptLayoutDocument() {
 // pages so the viewer must reload its page list from the server.  It may also
 // be holding a document the viewer has never seen, in which case Return used to
 // land on an empty viewer; adoptLayoutDocument() covers that case too.
-async function switchToViewerFromLayout() {
+//
+// *atPageId* (Layout's right-click "Open in viewer at this page", v3.4) opens
+// the viewer on that page instead of wherever it was.  loadPageList starts on
+// currentPageId, so it only has to be set after the reset and before the load.
+async function switchToViewerFromLayout(atPageId) {
+  const at = (typeof atPageId === 'string' && atPageId) ? atPageId : null;
   const layoutSid = (typeof sessionId !== 'undefined') ? sessionId : null;
   if (layoutSid && layoutSid !== SESSION_ID) {
-    await adoptLayoutDocument();
+    await adoptLayoutDocument(at || undefined);
   } else if (SESSION_ID && typeof _resetViewerState === 'function' && typeof loadPageList === 'function') {
     _resetViewerState();
+    if (at) {
+      currentPageId = at;
+      if (typeof _tabs !== 'undefined' && _tabs[_activeTabIdx]) _tabs[_activeTabIdx].page_id = at;
+    }
     loadPageList().then(() => {
       if (typeof loadAllAnnotations === 'function') loadAllAnnotations();
       if (typeof loadFormFields     === 'function') loadFormFields();

@@ -75,6 +75,59 @@ function grab(h, idx, dx = 0, dy = 0) {
   })()`);
 }
 
+// ── style controls apply on change (v3.4) ───────────────────────────────────
+// They used to wait for an "Apply style" button, so ticking Bold "did
+// nothing"; and with the word open for typing, clicking a control committed
+// the typing and dropped the style.
+
+test('ticking Bold restyles the selected run at once, sending only the change',
+     async () => {
+  const h = await viewer();
+  await arm(h);
+  h.run("_etSelect(_etItems.find(i => i.text === 'Alpha'))");
+  h.run("document.getElementById('at-et-bold').checked = true; editTextStyleChanged()");
+  await h.flush(20);
+  const e = edits(h);
+  eq(e.length, 1, 'no edit was sent');
+  eq(e[0].body.op, 'style');
+  eq(e[0].body.rl_font, 'Arial-Bold', 'Helvetica maps to the bundled Arial family');
+  eq(e[0].body.size, undefined, 'an untouched size must not be sent');
+  eq(e[0].body.color, undefined, 'an untouched colour must not be sent');
+  h.dispose();
+});
+
+test('nothing changed, nothing sent', async () => {
+  const h = await viewer();
+  await arm(h);
+  h.run("_etSelect(_etItems.find(i => i.text === 'Alpha'))");
+  h.run('editTextStyleChanged()');
+  await h.flush(10);
+  eq(edits(h).length, 0);
+  h.dispose();
+});
+
+test('with the word open, a style change previews and commits WITH the text',
+     async () => {
+  const h = await viewer();
+  await arm(h);
+  h.run("_etOpenEntry(_etItems.find(i => i.text === 'Alpha'))");
+  h.run("_etEntry.el.value = 'Gamma'");
+  // The click on the control must not count as "clicking away".  (The stub
+  // has no markup, so put the box inside the panel as viewer.html does.)
+  h.run(`document.getElementById('at-edittext-props').appendChild(document.getElementById('at-et-bold'))`);
+  h.run(`_etOutside({ target: document.getElementById('at-et-bold') })`);
+  eq(h.run('!!_etEntry'), true, 'clicking the Bold box committed the typing');
+  h.run("document.getElementById('at-et-bold').checked = true; editTextStyleChanged()");
+  assert(/bold/.test(h.run('_etEntry.el.style.font')), 'the open editor was not restyled');
+  eq(edits(h).length, 0, 'a style change mid-typing must not commit on its own');
+  h.run('_etCommitEntry()');
+  await h.flush(20);
+  const e = edits(h);
+  eq(e.length, 1, 'text and style should be ONE request (one Ctrl+Z)');
+  eq(e[0].body.op, 'text'); eq(e[0].body.text, 'Gamma'); eq(e[0].body.rl_font, 'Arial-Bold');
+  h.dispose();
+});
+
 // ── the gate ────────────────────────────────────────────────────────────────
 
 test('arming with the panel open loads the page and shows hit-areas', async () => {

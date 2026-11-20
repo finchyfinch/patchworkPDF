@@ -438,6 +438,56 @@ async function contextDelete() {
   contextPageId = null;
 }
 
+// ─── Open in viewer / Split (context, v3.4) ────────────────────────────
+// Open the viewer on the page that was right-clicked.
+function contextOpenInViewer() {
+  const pid = contextPageId;
+  document.getElementById('context-menu').style.display = 'none';
+  contextPageId = null;
+  if (!pid || !sessionId) return;
+  switchToViewerFromLayout(pid);
+}
+
+// Split the document at the right-clicked page: it and every later page move
+// out of this document into a NEW, unsaved one in its own tab.  Confirmed
+// first — Layout has no undo, and the pages leave this document.
+async function contextSplitFromHere() {
+  const pid = contextPageId;
+  document.getElementById('context-menu').style.display = 'none';
+  contextPageId = null;
+  if (!pid || !sessionId) return;
+  const idx = pages.findIndex(p => p.id === pid);
+  if (idx <= 0) {
+    showToast(window.t('toast.split_first_page'), 'error');
+    return;
+  }
+  const n = pages.length - idx;
+  const ok = await showConfirm(
+    window.t('confirm.split_from_here_msg', { page: idx + 1, count: n }),
+    window.t('confirm.split_from_here_title'),
+    window.t('confirm.split_from_here_ok'), 'btn-accent');
+  if (!ok) return;
+  try {
+    const res  = await apiFetch('/api/split_from', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ session_id: sessionId, page_id: pid })
+    });
+    const data = await res.json();
+    if (data.error) throw apiErr(data);
+    _layoutDirty();                         // this document lost pages
+    pages = pages.slice(0, idx);
+    renderGrid();
+    // The new document opens in its own tab (in the viewer) and is unsaved.
+    if (typeof openNewTab === 'function') {
+      openNewTab(data.session_id, data.page_id);
+      if (typeof pwSetDocDirty === 'function') pwSetDocDirty(true);
+    }
+    showToast(window.t('toast.split_done', { count: data.moved }), 'success');
+  } catch (err) {
+    showToast(window.t('toast.split_failed') + (err.message || err), 'error');
+  }
+}
+
 // ─── Move (context) ────────────────────────────────────────────────────
 // Right-click action on the single page under the cursor: move it to the very
 // front or back of the document. Same reorder-and-sync path as the toolbar

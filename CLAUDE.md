@@ -91,6 +91,29 @@ copy — keep it updated when project-wide facts change.
     `GetForegroundWindow` instead — the dialog is modal and ours, so our window
     regaining the foreground IS the dialog closing — then re-asserts focus until
     it verifiably sticks. Guarded by `tests/test_print_focus_guard.py`.
+- **Ctrl+P (and any app shortcut) is caught by the WINDOW, not just the page**
+  (`platform_io/win_shortcuts.py`, v3.4 — after years of partial fixes).
+  - Root cause, measured with real keypresses: raw `SetFocus` on WebView2's
+    `Chrome_RenderWidgetHostHWND` (what `focus_web_content` did) makes Windows
+    REPORT focus on the page while WebView2's own focus state is stale, so the
+    next key is dropped by everyone — after cancelling the Open dialog Ctrl+P
+    reached neither the page nor anything else. pywebview also disables
+    WebView2's browser accelerators in release builds, so there was no second
+    path.
+  - Focus is now handed back with the controller's `MoveFocus(Programmatic)`
+    (`focus_page`, tried first by `win_chrome.focus_web_content`). The
+    controller is the WinForms control's private `_coreWebView2Controller`
+    field — re-check after a WebView2 SDK / pywebview bump.
+  - Two native catchers: the controller's `AcceleratorKeyPressed` (page has
+    focus; raised in our process before the page sees the key, marked
+    Handled) and a hidden `MenuStrip` with `ShortcutKeys` (our window has
+    focus). Both run `pwAppShortcut('print', ...)` via `ExecuteScriptAsync`;
+    the page listener stays for other platforms, and `pwAppShortcut`
+    de-duplicates. Each Ctrl+P logs `[SHORTCUT] ... caught by the <path>` and
+    `[SHORTCUT] print via <path>: run|alreadyopen` (`/api/ui_event`).
+  - Verify on a desktop with `python tools/verify_ctrl_p.py` (five focus
+    situations incl. after Open and Print dialogs; 15/15 when written).
+    Guarded by `tests/test_window_shortcuts.py`, `tests/js/print_shortcut.test.mjs`.
 - **Foreground rights do not belong to the process that owns the window.**
   Windows lets only the foreground process (or one it has blessed) call
   `SetForegroundWindow`; everyone else is denied and the taskbar button flashes
@@ -602,6 +625,129 @@ object. See `docs/EDITOR_VIEWER_MERGE_PLAN.md` for the whole programme.
   must refuse that combination rather than misfire — a redaction that lands
   elsewhere leaves the content readable while reporting success.
 - Guarded by `tests/test_crop_coords.py`.
+
+- **A replacement is set in the DOCUMENT'S OWN font when it can be**
+  (`_NativeFont` in `routes/editor.py`, v3.4): the run's pdfium font name is
+  matched to a simple font in the page's (or a form XObject's) resources, and
+  if its ToUnicode / WinAnsi map has every character with a real width, the
+  new words go out as a `TJ` in that font (a space it lacks becomes a TJ gap).
+  Otherwise the mapped bundled face is the fallback. Choosing a font or
+  changing Bold/Italic in the panel sends `rl_font`, which opts out; a text
+  edit or move sends none (`_keep_native`). Logged as `[NATIVE_FONT]`.
+  - `_safe_rl_font`: weight counts as bold only at **700+** — pdfium ESTIMATES
+    weight as StemV x 5 when there is no /FontWeight, and regular Century
+    Gothic (StemV 120) read 600. Geometric/humanist sans names ("gothic",
+    "futura", "gill", …) are checked BEFORE the serif list, which contains
+    "century".
+- **On a quarter-turned page, a run's raw box corner is not where its text
+  starts.** apply_edits converts runs back to raw space and min/max-normalises
+  them; on /Rotate 90 the min corner is the glyphs' TOP in display, and an edit
+  landed a full line high. The display geometry is stashed (`_disp`) before
+  that conversion: `_run_anchor` maps the display (x, baseline) as a POINT, and
+  the same-line/fit logic runs on display-frame copies (`_fit_view`).
+  `_orient_text_items_for_display` also re-measures `size` (ink height) for
+  90/270 — it used to hold the run's width. Guarded by
+  `tests/test_native_font_edit.py` (synthetic page; the field file is a
+  client drawing and stays out of the repo).
+- **"Read text in images" is Force OCR that cannot lose text** (v3.4). The old
+  Editor's Force OCR (dropped in the 3.1 merge) REPLACED a page's native runs
+  with OCR words. Now `page_elements` with `read_images: true` just gives a
+  native page an OCR source (`ocr_source_bytes` = its current bytes) — the
+  same mechanism as an edited scan — so `_extract_text_and_graphics` keeps the
+  native runs and `_drop_ocr_under_native` adds only the words in pictures.
+  Session-only; a crop retires it; refused with `err.ocr_unavailable` when
+  Tesseract is not installed. The panel button shows only when
+  `can_read_images` (OCR available, no OCR words yet). Guarded by
+  `tests/test_read_text_in_images.py`.
+- **An OCR word's face, weight, size and baseline are ESTIMATED from its
+  pixels** (`pdf/font_guess.py`, v3.4; before, every OCR word was Calibri).
+  Each bundled face draws the OCR'd letters and is scored on width (at the
+  word's ink height), shape (IoU on the word's box) and stroke/height. Family
+  is voted per line (letter-weighted) with the page's family as a prior — a
+  line must beat it by `PAGE_PRIOR_MARGIN`/letter, or a short date or an
+  underlined link flips to Times. Weight: a word decides only on strong
+  evidence (|bold-regular| ≥ 0.25), else its line, else regular — small
+  screenshot words are noise. Size = mean of the height- and width-derived em
+  (`em_px`). `descent` (upright frame) lifts `baseline_y` for words with
+  descenders; `_orient_text_items_for_display` re-applies it on rotated
+  pages. Candidates are only faces apply_edits can embed, by design. Benchmark
+  (15 Windows fonts, blurred 300 dpi): family 45→96%, class 59→100%, weight
+  78→100%. Adds ~0.4s per OCR'd page (`post=` in `[OCR_TIMING]`); logs
+  `[FONT_GUESS]`. Guarded by `tests/test_ocr_font_guess.py`.
+- The Edit text panel shows the selected run's Font ("Document font (<name>)"),
+  Bold/Italic, Size (the em, `font_size`) and Colour (`_etFillStyle`); before
+  v3.4 only the words were filled in and Size always read "—".
+  - **The controls apply ON CHANGE** (`editTextStyleChanged`; the Apply style
+    button is gone) and send only what differs from the run
+    (`_etStyleFromPanel`). With the word open, `_etOutside` ignores clicks in
+    `#at-edittext-props`, the entry is restyled live, and Enter sends text +
+    style as ONE `text` op. After the rewrite `_etServeReselect` selects the
+    replacing run; a change made while one is in flight is replayed onto it
+    (`_etStyleAgain`) — the old id is dead by then.
+  - **A restyle keeps the words, so its ghost passed the covered-text filter**
+    (it matches `new_text`) and two runs sat at one spot; clicking could pick
+    the hidden original and show its old weight ("changing the weight does
+    nothing"). `_filter_covered_text_items` keeps only the LAST of a
+    (covered entry, text) group — our injection is appended at the end of the
+    stream. An explicit `size` skips `_fit_to_available`. Guarded by
+    `tests/test_native_font_edit.py` and `tests/js/viewer_edit_text.test.mjs`.
+
+- **Slow first click on a scan = OCR, and the log says where the time went.**
+  Arming Edit text loads the page in view at once, and `/api/viewer/page_elements`
+  takes a `progress_id` so the loading overlay shows the OCR stages (a native
+  page reports nothing; no overlay). Every load logs `[ET_LOAD]` (items, ocr,
+  took); every real OCR (cache miss) logs `[OCR_TIMING]` per stage (render /
+  prep / pass1 / pass2 / reread / post); a request that had to wait for the
+  background heavy-deps load logs `[HEAVY_WAIT]`. Tesseract is a separate
+  `tesseract.exe` per pass (and per light-on-dark re-read) talking through temp
+  files, so endpoint security on a work PC shows up as slow pass/reread stages.
+- **Launching Tesseract is the expensive part on a locked-down PC, so launch it
+  less — without changing a result** (v3.4; a work laptop took 19.6s for one
+  invoice, 7.6s of it re-reading header words one process each):
+  - `run_two_passes` runs the psm 6 and psm 11 passes concurrently (timed
+    together as `passes=` in `[OCR_TIMING]`).
+  - `_reread_batch` re-reads every light-on-dark word in ONE process: a list
+    file of PNGs saved exactly as pytesseract saves them, same args, read as one
+    page per image. Exact because the bundled data is tessdata_fast
+    (LSTM-only — no adaptation carries between pages); verified identical on
+    186 words / 17 sample pages. Any failure falls back to one process per word.
+    If the language data ever changes to one with a legacy engine, re-verify.
+  - `warm_up_ocr` does a throwaway read after `_heavy_init` (`[OCR_WARMUP]`) so
+    the cold start (exe, DLLs, traineddata — scanned by AV on first load) is
+    paid before anyone clicks. No-op when Tesseract is not installed (optional).
+  - `hidden_console` is now reference-counted: it swaps the global
+    `subprocess.Popen`, and overlapping threads used to restore each other's
+    patch. Guarded by `tests/test_ocr_speedups.py`.
+
+## Viewer page navigation (far jumps)
+
+- **A far jump must record its own scroll.** `goToPage` jumps instantly and
+  pins the target (`_pendingPin`) until the pages above reach their real
+  heights; `_onAreaScroll` drops the pin on any scroll it did not cause, judged
+  by `_selfScrollAt`. `goToPage` sets `_selfScrollAt` right after its
+  `scrollIntoView` — without it the jump's own scroll event killed the pin
+  before anything rendered, and each page above shrinking from its placeholder
+  estimate (~27px) pushed the view onto the page BEFORE the clicked thumbnail.
+  The pin re-applies on ANY render above the target and only lets go once none
+  is still queued/in flight. Guarded by `tests/js/viewer_thumb_jump.test.mjs`.
+- The viewer's thumbnail rail does not reorder pages (Layout does), so its
+  items/images are `draggable="false"` — the native image ghost read as a
+  broken reorder feature.
+- The print dialog's range field is `readOnly`, never `disabled`, outside
+  Custom: a disabled input gets no click/focus, so clicking it could not switch
+  to Custom (`_printRangeActivate`).
+
+## Layout page context menu (v3.4)
+
+- **Open in viewer at this page** → `switchToViewerFromLayout(pageId)`: the
+  page id is set as `currentPageId` after the viewer reset and before
+  `loadPageList`, which is what picks the starting page.
+- **Split document from here** → `/api/split_from`: the page and every later
+  one are MOVED (records and all) into a new session with
+  `first_file_path: None` and filename "<stem> (from page N).pdf", opened via
+  `openNewTab` and flagged dirty. Bookmarks follow their page; undo entries
+  for moved pages are dropped from the original. Splitting at page 1 is
+  refused. Guarded by `tests/test_split_from.py`.
 
 ## Viewer request budget
 

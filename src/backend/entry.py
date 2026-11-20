@@ -819,6 +819,13 @@ def _attach_window_chrome(window, api, start_maximized=False):
             win_chrome.apply(window)
         except Exception as e:
             _log(f"custom chrome not applied: {e}")
+        # Ctrl+P (and friends) caught by the WINDOW, so they work wherever
+        # keyboard focus is — see platform_io/win_shortcuts.py.
+        try:
+            from platform_io import win_shortcuts
+            win_shortcuts.install(window)
+        except Exception as e:
+            _log(f"window shortcuts not installed: {e}")
         _block_file_navigation_gtk(window)      # stop the Linux drag-drop hijack
         if start_maximized:
             try:
@@ -2079,6 +2086,20 @@ def recovery_clear():
         _recovery.clear(sessions[sid])
     elif data.get('docId'):
         _recovery.purge(data['docId'])
+    return jsonify({'ok': True})
+
+
+@app.route('/api/ui_event', methods=['POST'])
+def ui_event():
+    """Diagnostic-only: the page reports which path caught a shortcut, so a
+    "Ctrl+P did nothing" report can be read off the log ([SHORTCUT]).  Logs a
+    short whitelisted label, nothing else."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name', ''))[:20]
+    via  = str(data.get('via', ''))[:20]
+    outcome = str(data.get('outcome', ''))[:20]
+    if name.isalnum() and via.isalnum() and (not outcome or outcome.isalnum()):
+        logger.info('[SHORTCUT] %s via %s: %s', name, via, outcome or 'run')
     return jsonify({'ok': True})
 
 

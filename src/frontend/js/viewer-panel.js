@@ -828,6 +828,9 @@ async function loadPageList() {
 }
 
 // ── Thumbnail list ──────────────────────────────────────────────────────────
+// The viewer's rail does NOT reorder pages (Layout does), so the browser's own
+// image drag is switched off: dragging a thumbnail used to pull a ghost image
+// across the window, which read as a reorder feature that was broken (v3.4).
 function renderThumbList() {
   const list = document.getElementById('thumb-list');
   if (!list) return;
@@ -840,8 +843,10 @@ function renderThumbList() {
   list.innerHTML = allPages.map((p, i) => `
     <div class="thumb-item${i === currentIdx ? ' active' : ''}"
          id="thumb-${p.id}" onclick="goToPage(${i})"
+         draggable="false" ondragstart="return false"
          oncontextmenu="showPageCtx(event, '${p.id}')">
       <img src="data:image/png;base64,${p.thumbnail}" alt="Page ${p.page_num}"
+           draggable="false"
            loading="lazy"${_thumbBoxStyle(p)} onload="this.style.aspectRatio=''">
       <div class="thumb-label">p.${p.page_num}</div>
     </div>
@@ -1251,8 +1256,13 @@ async function _renderPageBlockNow(idx) {
       // target so it stays at the top of the viewport.
       // (A held anchor cares about every page above it, not just its neighbours
       // — any of them settling to its real height shifts the anchor down.)
-      if (_pendingPin && idx <= _pendingPin.idx
-          && (_pendingPin.hold || idx >= _pendingPin.idx - PRERENDER_MARGIN)) _applyPendingPin();
+      // ANY page above the target counts, not only its PRERENDER_MARGIN
+      // neighbours: the lazy observer's 400px margin reaches the page above the
+      // target, whose own _triggerRenderAround queues pages further up still.
+      // When one of those landed after the pin had let go, its real height
+      // replaced the estimate and pushed the target down a page — a far
+      // thumbnail click showed the page BEFORE the one clicked (v3.4 fix).
+      if (_pendingPin && idx <= _pendingPin.idx) _applyPendingPin();
       // If this re-render was triggered by lifting an annotation, build the
       // draft now (the block was just rebuilt, so it's safe to attach to).
       if (_pendingLift && _pendingLift.page_id === p.id) {
@@ -1501,6 +1511,16 @@ function goToPage(idx) {
     // *estimated* placeholder heights; keep it pinned to the top until the
     // pages above it render to their true heights (or the user scrolls away).
     _pendingPin = far ? { pageId: p.id, idx, gen } : null;
+    // An instant scrollIntoView has already moved the viewport, and its scroll
+    // EVENT arrives a frame later.  Record where we put it, or _onAreaScroll
+    // takes that event for the user scrolling away and drops the pin before a
+    // single page above the target has rendered — each then lands at its real
+    // height and pushes the target down, so a far thumbnail click showed the
+    // page BEFORE the one clicked (v3.4 fix).
+    if (far) {
+      const area = document.getElementById('canvas-area');
+      if (area) _selfScrollAt = { top: area.scrollTop, left: area.scrollLeft };
+    }
   }
   // Optimistically update current-page state for instant thumb/nav feedback
   currentIdx    = idx;
@@ -1568,11 +1588,17 @@ function _applyPendingPin() {
     _selfScrollAt = { top: area.scrollTop, left: area.scrollLeft };
   }
   if (_pendingPin.hold) return;
-  // Done once every page from the target upward to the prerender margin is in.
+  // Done once every page from the target upward to the prerender margin is in
+  // AND no page above the target is still queued or in flight — any of those
+  // would move the target when it lands.
   const lo = Math.max(0, _pendingPin.idx - PRERENDER_MARGIN);
   for (let i = lo; i <= _pendingPin.idx; i++) {
     const st = _pageBlocks.get(allPages[i].id);
     if (st && !st.rendered) return;        // still settling — keep the pin
+  }
+  for (let i = 0; i < lo; i++) {
+    const st = _pageBlocks.get(allPages[i].id);
+    if (st && st.rendering) return;        // will change height when it lands
   }
   _pendingPin = null;
 }
@@ -5619,7 +5645,10 @@ function _printSetMode(mode) {
   }
   const inp = document.getElementById('print-range');
   if (inp) {
-    inp.disabled = (mode !== 'custom');
+    // readOnly, never disabled: a disabled input receives no click or focus,
+    // so clicking into it could not switch to Custom (v3.4 fix).
+    inp.disabled = false;
+    inp.readOnly = (mode !== 'custom');
     if (mode === 'custom') { inp.focus(); }
   }
   // Presets rewrite the field; Custom is user-driven so leave their text alone.
@@ -5633,10 +5662,25 @@ function _printToggleThumb(i) {
     const radio = document.querySelector('input[name="print-mode"][value="custom"]');
     if (radio) radio.checked = true;
     const inp = document.getElementById('print-range');
-    if (inp) inp.disabled = false;
+    if (inp) inp.readOnly = false;
   }
   if (_printSel.has(i)) _printSel.delete(i); else _printSel.add(i);
   _printSyncUI();   // rewrite the field to match the new selection
+}
+
+// Clicking (or tabbing) into the read-only range field means "I want to type
+// pages": select Custom, unlock the field and leave the caret at the end of the
+// text, ready for entry.
+function _printRangeActivate() {
+  const inp = document.getElementById('print-range');
+  if (!inp || _printMode === 'custom') return;
+  _printSetMode('custom');
+  // The mousedown that focused a read-only field has already placed (or
+  // withheld) the caret; put it at the end once the field is editable.
+  const place = () => {
+    try { inp.focus(); const n = inp.value.length; inp.setSelectionRange(n, n); } catch (_) {}
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(place); else place();
 }
 
 function _printRangeInput() {
@@ -5742,12 +5786,35 @@ document.addEventListener('keydown', function(e) {
 }, true);
 
 // ── Keyboard shortcuts ───────────────────────────────────────────────────────
+// Ctrl+P has TWO paths (v3.4).  This page listener only hears keys while focus
+// is inside the web content; on Windows the app window also catches Ctrl+P
+// itself (platform_io/win_shortcuts.py), which works wherever focus is — the
+// fix for "Ctrl+P does nothing, the Print button works".  Both arrive here, so
+// a second copy within a moment, or one while the dialog is already open, is
+// ignored.  Each is reported to the log as [SHORTCUT] <name> caught by <via>.
+let _lastAppShortcut = { name: '', at: 0 };
+window.pwAppShortcut = function (name, via) {
+  const now = Date.now();
+  if (_lastAppShortcut.name === name && now - _lastAppShortcut.at < 600) return;
+  _lastAppShortcut = { name, at: now };
+  let outcome = 'run';
+  if (name === 'print') {
+    const ov = document.getElementById('print-modal-overlay');
+    if (ov && ov.classList && ov.classList.contains('show')) outcome = 'alreadyopen';
+    else printDocument();
+  }
+  try {
+    apiFetch('/api/ui_event', { method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ name, via: via || 'page', outcome }) }).catch(() => {});
+  } catch (_) {}
+};
+
 // Capture-phase listener intercepts Ctrl+P before the browser handles it
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'p' && (e.ctrlKey || e.metaKey)) {
+  if ((e.key === 'p' || e.key === 'P') && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
     e.preventDefault();
     e.stopPropagation();
-    printDocument();
+    window.pwAppShortcut('print', 'page');
   }
 }, true);
 
@@ -7490,6 +7557,7 @@ function _etRenderOverlays() {
 // page would OCR every visible scan.
 let _etWant = null;
 let _etPending = null;   // {pid, x, y}: a click that asked for another page
+let _etReadImagesFor = null;   // page asked to "Read text in images" (v3.4)
 
 async function _etLoadForCurrentPage() {
   return _etLoadPage(currentPageId);
@@ -7502,12 +7570,29 @@ async function _etLoadPage(pid) {
   const want = pid;
   _etLoading = true;
   _etSel = null;
+  // A scanned page is OCR'd by this request — seconds on a slow machine, and
+  // the first click on a word used to look ignored while it ran (v3.4).  The
+  // server reports the OCR stages under a job id, so the same loading overlay
+  // text selection uses shows them; a native page reports nothing and the
+  // overlay never appears.  Arming the tool loads the page in view at once,
+  // so the OCR happens when the user picks Edit text, not on their first click.
+  const jobId    = (typeof newProgressId === 'function') ? newProgressId() : '';
+  const stopPoll = (jobId && typeof startProgressPoll === 'function')
+                   ? startProgressPoll(jobId) : () => {};
+  const t0 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
   try {
     const res = await _vFetch('/api/viewer/page_elements', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({session_id: SESSION_ID, page_id: want}),
+      body: JSON.stringify({session_id: SESSION_ID, page_id: want, progress_id: jobId,
+                            read_images: _etReadImagesFor === want || undefined}),
     });
     const data = await res.json();
+    const askedImages = (_etReadImagesFor === want);
+    if (askedImages) _etReadImagesFor = null;
+    try {
+      const t1 = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+      console.info(`[edit text] page ${want}: ${(data.items || []).length} runs in ${Math.round(t1 - t0)} ms`);
+    } catch (_) {}
     if (data.error) throw apiErr(data);
     // The user may have scrolled (or clicked) on while this was in flight.
     if (want !== _etWant || !_etActive()) return;
@@ -7519,13 +7604,40 @@ async function _etLoadPage(pid) {
     _etRenderOverlays();
     _etSelect(null);             // and the panel must not keep naming a stale run
     _etServePendingClick(want);
+    _etShowReadImages(!!data.can_read_images);
+    if (askedImages) {
+      const n = +data.ocr_words || 0;
+      showToast(n ? window.t('toast.read_images_done', { count: n })
+                  : window.t('toast.read_images_none'), n ? 'success' : 'info');
+    }
   } catch (err) {
     showToast(err.message || String(err), 'error');
   } finally {
+    stopPoll();
+    if (jobId && typeof hideLoading === 'function') hideLoading();
     _etLoading = false;
     // A page change that arrived mid-flight still needs serving.
     if (_etActive() && _etWant && _etPage !== _etWant) _etLoadPage(_etWant);
   }
+}
+
+// ── "Read text in images" (v3.4) ───────────────────────────────────────────
+// The old Editor's Force OCR, done so it cannot lose anything: the page's own
+// text stays exactly as it is, and OCR only ADDS the words found where there
+// is no real text (pictures).  One request — the same page_elements load,
+// asked to OCR — so it shows the same progress overlay and reloads the model.
+function _etShowReadImages(on) {
+  const b = document.getElementById('at-et-readimg');
+  if (b) b.style.display = on ? '' : 'none';
+}
+
+function editTextReadImages() {
+  const pid = _etPage || _etWant || currentPageId;
+  if (!_etActive() || !pid) return;
+  _etShowReadImages(false);
+  _etReadImagesFor = pid;
+  _etInvalidate(pid, false);
+  _etLoadPage(pid);
 }
 
 function _etSelect(item) {
@@ -7547,6 +7659,7 @@ function _etSelect(item) {
   }
   const box = document.getElementById('at-et-selected');
   if (box) box.textContent = item ? item.text : '';
+  _etFillStyle(item);
   const del = document.getElementById('at-et-delete');
   if (del) del.disabled = !item;
   const blk = document.getElementById('at-et-block');
@@ -7611,6 +7724,10 @@ function _etCloseEntry() {
 function _etOutside(e) {
   if (!_etEntry) return;
   if (_etEntry.wrap.contains && _etEntry.wrap.contains(e.target)) return;
+  // The style controls are part of the edit (v3.4): changing Bold or the size
+  // while typing restyles the open editor rather than committing it.
+  const props = document.getElementById('at-edittext-props');
+  if (props && props.contains && props.contains(e.target)) return;
   _etCommitEntry();
 }
 
@@ -7704,11 +7821,14 @@ function _etCommitEntry() {
   const next = E.el.value;
   const item = E.item;
   _etCloseEntry();
+  // Text and style go in ONE request, so a retype-and-bold is one Ctrl+Z.
+  const style = _etStyleFromPanel(item);
   // An unchanged editor commits nothing: re-injecting identical text would
   // still re-render the run in the app's font and cost an undo step for a
   // change the user never made.
-  if (next === item.text) return;
-  _etCommit(item.id, 'text', { text: next });
+  if (next === item.text && !Object.keys(style).length) return;
+  _etReselectAfter(item, next);
+  _etCommit(item.id, 'text', Object.assign({ text: next }, style));
 }
 
 // ── committing ──────────────────────────────────────────────────────────────
@@ -7749,12 +7869,12 @@ function _etPost(url, page_id, body) {
     }
     // The page was rewritten, so every element id from the last load is stale.
     _etPage = null;
-    return _etLoadPage(page_id);
+    return _etLoadPage(page_id).then(_etServeReselect);
   })
   .catch(err => {
     showToast(err.message || String(err), 'error');
     _etPage = null;
-    return _etLoadPage(page_id);
+    return _etLoadPage(page_id).then(_etServeReselect);
   }));
 }
 
@@ -7764,13 +7884,164 @@ function editTextDeleteSelected() {
   _etSel = null;
 }
 
-function editTextRestyleSelected() {
-  if (!_etSel) return;
-  _etCommit(_etSel, 'style', {
-    size:    parseFloat(_ctlVal('at-et-size', '')) || undefined,
-    color:   _ctlVal('at-et-color', '') || undefined,
-  });
+// ── the selected run's style in the panel (v3.4) ───────────────────────────
+// The panel used to show only the words: Size stayed "—" and there was no font
+// or weight at all, so nothing said what the run was set in or let it be
+// changed.  Selecting a run now fills Font / Bold / Italic / Size / Colour from
+// it; "Document font" means the PDF's own embedded font (the server re-uses
+// it when it has every glyph needed), and picking a font or changing
+// Bold/Italic sends a bundled face instead.
+
+function _etStyleOf(item) {
+  const rl   = String((item && item.rl_font) || '');
+  const name = String((item && item.font) || '').toLowerCase();
+  return {
+    bold:   /bold|black|heavy/.test(rl.toLowerCase()) || /bold|black|heavy/.test(name),
+    italic: /italic|oblique/.test(rl.toLowerCase()) || /italic|oblique/.test(name),
+  };
 }
+
+/** Bundled family for a run's mapped rl_font ('Arial-Bold' → 'Arial'). */
+function _etFamilyOf(rl) {
+  const base = String(rl || '').split('-')[0];
+  if (['Calibri', 'Arial', 'TimesNR', 'CourierNew'].includes(base)) return base;
+  if (/^times/i.test(base)) return 'TimesNR';
+  if (/^courier/i.test(base)) return 'CourierNew';
+  return 'Arial';                       // Helvetica and anything unmapped
+}
+
+function _etFillStyle(item) {
+  const doc = document.getElementById('at-et-font-doc');
+  if (doc) {
+    const nm = item && item.font ? String(item.font).replace(/^[A-Z]{6}\+/, '') : '';
+    // An OCR'd word has no font of its own; say which face was matched to it
+    // (pdf/font_guess.py) rather than pretend it is the document's font.
+    const isOcr = !!(item && String(item.id || '').startsWith('ocr'));
+    const FAM = { Calibri: 'Calibri', Arial: 'Arial', TimesNR: 'Times New Roman',
+                  CourierNew: 'Courier New' };
+    const matched = isOcr ? (FAM[_etFamilyOf(item.rl_font)] || '') : '';
+    doc.textContent = matched ? window.t('at_edittext_props.font_matched', { name: matched })
+                    : nm ? window.t('at_edittext_props.font_doc_named', { name: nm })
+                         : window.t('at_edittext_props.font_doc');
+  }
+  const f = document.getElementById('at-et-font');
+  if (f) f.value = '';
+  const st = _etStyleOf(item);
+  const b = document.getElementById('at-et-bold');   if (b) b.checked = !!(item && st.bold);
+  const i = document.getElementById('at-et-italic'); if (i) i.checked = !!(item && st.italic);
+  const sz = document.getElementById('at-et-size');
+  if (sz) {
+    const em = item ? (+item.font_size || 0) : 0;
+    sz.value = em > 0 ? String(Math.round(em * 10) / 10) : '';
+  }
+  const c = document.getElementById('at-et-color');
+  if (c && item && /^#[0-9a-f]{6}$/i.test(item.color || '')) c.value = item.color;
+}
+
+/** rl_font to request, or undefined to keep the document's own font. */
+function _etChosenFont(item) {
+  const fam  = _ctlVal('at-et-font', '');
+  const bold = !!document.getElementById('at-et-bold')?.checked;
+  const ital = !!document.getElementById('at-et-italic')?.checked;
+  const st   = _etStyleOf(item);
+  if (!fam && bold === st.bold && ital === st.italic) return undefined;
+  const base = fam || _etFamilyOf(item && item.rl_font);
+  return base + (bold && ital ? '-BoldItalic' : bold ? '-Bold' : ital ? '-Italic' : '');
+}
+
+/** Only what the panel CHANGES relative to the run: an untouched Size or
+ *  Colour must not be sent, or every restyle would also "set" them (and a
+ *  rounded size would nudge the text). */
+function _etStyleFromPanel(item) {
+  const out = {};
+  if (!item) return out;
+  const rl = _etChosenFont(item);
+  if (rl) out.rl_font = rl;
+  const sz = parseFloat(_ctlVal('at-et-size', ''));
+  const cur = Math.round((+item.font_size || 0) * 10) / 10;
+  if (sz > 0 && Math.abs(sz - cur) > 0.05) out.size = sz;
+  const col = String(_ctlVal('at-et-color', '') || '').toLowerCase();
+  if (/^#[0-9a-f]{6}$/.test(col) && col !== String(item.color || '#000000').toLowerCase()) {
+    out.color = col;
+  }
+  return out;
+}
+
+// After a rewrite every id is new; select the run that replaced this one so
+// the panel keeps showing it (and a second change applies to the NEW run).
+let _etReselect = null;
+function _etReselectAfter(item, text) {
+  _etReselect = item ? { x: (item.x + item.x2) / 2, y: (item.y + item.y2) / 2,
+                         text: text != null ? text : item.text } : null;
+}
+function _etServeReselect() {
+  const R = _etReselect;
+  _etReselect = null;
+  if (!R || !_etItems.length) return;
+  let best = null, bd = Infinity;
+  for (const it of _etItems) {
+    if (it.text !== R.text) continue;
+    const d = Math.hypot((it.x + it.x2) / 2 - R.x, (it.y + it.y2) / 2 - R.y);
+    if (d < bd) { bd = d; best = it; }
+  }
+  if (best && bd < 30) _etSelect(best);
+  // A control changed while that rewrite was in flight: put the user's
+  // choices back (the reload refilled the panel from the run) and apply them
+  // to the NEW run — its id is the only valid one now.
+  const again = _etStyleAgain;
+  _etStyleAgain = null;
+  if (again && best && bd < 30) {
+    const set = (id, k, v) => { const el = document.getElementById(id); if (el) el[k] = v; };
+    set('at-et-font', 'value', again.font);
+    set('at-et-bold', 'checked', again.bold);
+    set('at-et-italic', 'checked', again.italic);
+    set('at-et-size', 'value', again.size);
+    set('at-et-color', 'value', again.color);
+    editTextStyleChanged();
+  }
+}
+let _etStyleAgain = null;
+
+/** A Font / Bold / Italic / Size / Colour control changed (v3.4: they used to
+ *  wait for an "Apply style" button, so changing the weight looked like it did
+ *  nothing).  With the word open for typing, restyle the editor so you see
+ *  what you will get — text and style commit together on Enter.  Otherwise
+ *  restyle the selected run straight away. */
+function editTextStyleChanged() {
+  if (!_etActive()) return;
+  const E = _etEntry;
+  if (E && !E.block) {
+    const item = E.item;
+    const rl = _etChosenFont(item) || item.rl_font || 'Helvetica';
+    const st = _pageBlocks.get(_etPage);
+    const s  = st ? st.renderScale * zoomLevel : 1;
+    const sz = parseFloat(_ctlVal('at-et-size', '')) || _etEm(item);
+    E.el.style.font = _ptFontCss(rl, Math.max(9, sz * s));
+    const col = _ctlVal('at-et-color', '');
+    if (/^#[0-9a-f]{6}$/i.test(col)) _etEntryColours(E.el, col);
+    try { E.el.dispatchEvent(new Event('input')); } catch (_) {}   // refit width
+    if (E.el.focus) E.el.focus();
+    return;
+  }
+  if (_etReselect) {           // a restyle is still being written
+    _etStyleAgain = {
+      font: _ctlVal('at-et-font', ''), size: _ctlVal('at-et-size', ''),
+      color: _ctlVal('at-et-color', ''),
+      bold: !!document.getElementById('at-et-bold')?.checked,
+      italic: !!document.getElementById('at-et-italic')?.checked,
+    };
+    return;
+  }
+  if (!_etSel) return;
+  const item = _etItems.find(i => i.id === _etSel);
+  const style = _etStyleFromPanel(item);
+  if (!Object.keys(style).length) return;
+  _etReselectAfter(item);
+  _etCommit(_etSel, 'style', style);
+}
+
+// Kept for anything still calling the old button's handler.
+function editTextRestyleSelected() { editTextStyleChanged(); }
 
 function _etKey(e) {
   if (!_etActive() || _etEntry) return;

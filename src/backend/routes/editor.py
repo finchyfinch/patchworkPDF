@@ -13,6 +13,7 @@ import base64
 import random
 import re
 import hashlib
+import time as _time
 import copy as _copy
 import pypdf
 from bootstrap import recovery as _recovery
@@ -21,6 +22,7 @@ import pypdf as _pypdf
 import threading as _editor_threading
 import logging
 from pdf import ocr_utils as _ocr_utils
+from pdf import font_guess as _font_guess
 from platform_io import font_assets as _font_assets
 from pdf.ocr_utils import _NATIVE_LOCK
 from pdf import pdf_core as _pdf_core
@@ -82,6 +84,11 @@ def _heavy_init():
         _OCR_AVAILABLE          = _ocr_utils.is_ocr_available()
         _OCR_UNAVAILABLE_REASON = _ocr_utils.ocr_unavailable_reason()
         _pytesseract            = _ocr_utils._pytesseract
+        # Pay Tesseract's cold start now, in the background, rather than on
+        # the user's first Edit text click.  Does nothing when Tesseract is
+        # not installed (it is optional).
+        if _OCR_AVAILABLE:
+            _ocr_utils.warm_up_ocr()
 
         _INIT_DONE = True
         if _boot:
@@ -177,7 +184,15 @@ def _orient_text_items_for_display(items, rotate, raw_W, raw_H):
         n['x2'], n['y2'] = max(ax, bx), max(ay, by)
         if 'original_x' in n: n['original_x'] = n['x']
         if 'original_y' in n: n['original_y'] = n['y']
-        if 'baseline_y' in n: n['baseline_y'] = n['y']   # box-bottom ≈ baseline
+        if 'baseline_y' in n:
+            # box bottom ≈ baseline, less any descent OCR measured (upright frame)
+            n['baseline_y'] = n['y'] + float(it.get('descent') or 0.0)
+        # `size` is the ink height, measured along raw y.  A quarter turn swaps
+        # the axes, so for text that reads upright on screen raw y is the run's
+        # LENGTH: a "5" came through as 9.4pt (its width) and the panel showed
+        # no usable size.  Re-measure it in the frame the user sees.
+        if rotate in (90, 270) and 'size' in n:
+            n['size'] = round(n['y2'] - n['y'], 3)
         out.append(n)
     return out
 
@@ -298,8 +313,13 @@ def _safe_rl_font(name, flags=0, weight=0):
         n = n.split('+', 1)[1]
     flags  = flags or 0
     weight = weight or 0
+    # Weight 700+ only.  pdfium's FPDFText_GetFontWeight ESTIMATES the weight
+    # (StemV x 5) when the descriptor has no /FontWeight, and a REGULAR face
+    # with a sturdy stem lands on 600: Century Gothic (StemV 120) read as bold
+    # and every edit came back heavier than the text it replaced (v3.4).
+    # A genuine semibold says so in its name.
     is_bold   = (any(x in n for x in ('bold', 'black', 'heavy', 'semibold', 'demibold', 'demi'))
-                 or weight >= 600 or bool(flags & _FD_FORCE_BOLD))
+                 or weight >= 700 or bool(flags & _FD_FORCE_BOLD))
     is_italic = (any(x in n for x in ('italic', 'oblique', 'slant'))
                  or bool(flags & _FD_ITALIC))
 
@@ -312,6 +332,13 @@ def _safe_rl_font(name, flags=0, weight=0):
     # Monospace / typewriter
     if any(x in n for x in ('courier', 'mono', 'consol', 'inconsolata', 'typewriter')):
         return _variant('CourierNew')
+    # Sans faces whose names would otherwise trip the serif list below
+    # ("Century Gothic" contains "century") or that set the descriptor's Serif
+    # bit regardless (Century Gothic's subsets do).  Checked FIRST.
+    if any(x in n for x in ('gothic', 'futura', 'avant', 'gill', 'montserrat',
+                            'poppins', 'raleway', 'nunito', 'myriad', 'frutiger',
+                            'univers', 'sans serif', 'sansserif', 'sans-serif')):
+        return _variant('Arial')
     # Serif
     if any(x in n for x in ('times', 'roman', 'serif', 'georgia', 'garamond', 'cambria',
                             'minion', 'palatino', 'antiqua', 'century', 'plantin',
@@ -785,6 +812,20 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
         logger.debug(f"[OCR_CACHE] hit ({len(_hit)} items) key={_ck[0][:12]} scale={_ck[1]}")
         return _copy.deepcopy(_hit)
 
+    # Stage timings, logged once per real OCR (cache misses only) as
+    # [OCR_TIMING].  Tesseract runs as a separate tesseract.exe per pass and
+    # talks to us through temp files, so endpoint security that inspects every
+    # process launch / temp write shows up as slow pass1/pass2 while render and
+    # prep stay fast — the "instant at home, several seconds on the work
+    # laptop" report.  The line tells the two cases apart.
+    _t0 = _tl = _time.perf_counter()
+    _tm = {}
+    def _lap(name):
+        nonlocal _tl
+        now = _time.perf_counter()
+        _tm[name] = now - _tl
+        _tl = now
+
     # Get the page rotation from the PDF dictionary (pure pypdf — no lock needed)
     _pypdf_reader = _pypdf.PdfReader(io.BytesIO(pdf_bytes))
     _pypdf_page   = _pypdf_reader.pages[0]
@@ -804,6 +845,7 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
             img = bmp.to_pil()
         finally:
             doc.close()
+    _lap('render')
 
     # ── Grayscale array for bold-weight detection ─────────────────────────────
     # Bold strokes are thicker, so a word's bounding-box has a higher dark-pixel
@@ -825,21 +867,17 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
     _cx, _cy = img.width / 2.0, img.height / 2.0
     if _skew:
         logger.debug(f"[OCR] deskew applied: {_skew:+.2f}°")
+    _lap('prep')
 
     # ── Run two OCR passes ────────────────────────────────────────────────────
     # Pass 1: --psm 6  (uniform block) — layout-aware, returns block/par/line
     # Pass 2: --psm 11 (sparse text)   — catches isolated words psm 6 misses,
     #                                    but has no reliable layout hierarchy
-    with _ocr_utils.hidden_console():
-        _olang, _ocfg = _ocr_utils.ocr_lang_config()
-        _ocr_utils.report_ocr_progress(progress_cb, _ocr_utils.OCR_STAGE_PASS1)
-        data1 = _pytesseract.image_to_data(
-            ocr_img, output_type=_pytesseract.Output.DICT,
-            lang=_olang, config='--psm 6' + _ocfg)
-        _ocr_utils.report_ocr_progress(progress_cb, _ocr_utils.OCR_STAGE_PASS2)
-        data2 = _pytesseract.image_to_data(
-            ocr_img, output_type=_pytesseract.Output.DICT,
-            lang=_olang, config='--psm 11' + _ocfg)
+    # The two passes run CONCURRENTLY (separate Tesseract processes, same
+    # image — identical results), so they are timed together as 'passes'.
+    _olang, _ocfg = _ocr_utils.ocr_lang_config()
+    data1, data2 = _ocr_utils.run_two_passes(ocr_img, _olang, _ocfg, progress_cb)
+    _lap('passes')
 
     _ocr_utils.report_ocr_progress(progress_cb, _ocr_utils.OCR_STAGE_FINALISE)
 
@@ -888,6 +926,7 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
     # at 96%), so give those words a second, polarity-corrected read.  Boxes
     # are in the original frame here, which is what _img_gray is.
     _ocr_utils.reread_light_on_dark(_img_gray, all_words, _olang, _ocfg)
+    _lap('reread')
 
     # ── One item per word (matches native PDF behaviour) ─────────────────────
     # Each word from both passes becomes its own independent item.
@@ -1035,11 +1074,17 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
         # 0.135 sits in the gap between regular (≈0.08–0.12) and bold (≈0.15–0.20)
         # stroke-width-to-height ratios.  Operator can override via the Font dropdown.
         _is_bold = _sw_ratio > 0.135
-        # Default OCR typeface is Calibri (Carlito) — a far closer match to the
-        # humanist sans used by most scanned office documents than base-14
-        # Helvetica.  The operator can override via the Font dropdown; serif/sans
-        # auto-classification is layered on in a later phase (C).
+        # Provisional face: Calibri (Carlito), bold by stroke.  The real
+        # estimate — family, weight and size from matching the word's pixels
+        # against each bundled face drawing the same letters — happens after
+        # the loop, where a whole line can vote (pdf/font_guess.py, v3.4).
         detected_rl_font = 'Calibri-Bold' if _is_bold else 'Calibri'
+        try:
+            _fg_scores = (_font_guess.score_faces(_ink_mask, line_text)
+                          if _ink_mask is not None else {})
+        except Exception:
+            logger.debug('[FONT_GUESS] scoring failed', exc_info=True)
+            _fg_scores = {}
 
         # ── Ink colour detection ──────────────────────────────────────────────
         # Previously every OCR word was emitted as #000000, so the editor panel's
@@ -1101,6 +1146,9 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
             'font_size':  font_size,
             'font':       'unknown',
             'rl_font':    detected_rl_font,
+            '_fg':        _fg_scores,
+            '_ink':       _ink_mask,
+            '_vis_pt':    vis_size,
             'color':      detected_color,
             'original_x': round(x1, 3),
             'original_y': round(y1, 3),
@@ -1152,6 +1200,77 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
     for _it in items:
         _rows.setdefault(_it['ocr_row'], []).append(_it)
 
+    # ── Typeface + weight (pdf/font_guess.py) ────────────────────────────────
+    # A line is set in one family, and one word is weak evidence, so the
+    # family is voted per line (letter-weighted), falling back to the page's
+    # vote for a line with nothing to go on.  Weight stays per word — a bold
+    # label beside regular text on one line is normal.  The em size is then
+    # re-derived for the chosen face, since faces differ in cap height.
+    def _alnum_n(t):
+        return sum(c.isalnum() for c in t)
+    _page_fam = _font_guess.vote_line(
+        [(_alnum_n(_it['text']), _it.get('_fg')) for _it in items])
+    for _row_items in _rows.values():
+        _fam = _font_guess.choose_family(
+            [(_alnum_n(_it['text']), _it.get('_fg')) for _it in _row_items], _page_fam)
+        if _fam is None:
+            continue
+        # Weight evidence per word = score(bold) - score(regular) in the chosen
+        # family.  Large words give a clear answer (±0.3-0.5); small words in a
+        # screenshot or scan hover near zero and flip either way, which made
+        # half of "Prepared by Harbourside … June 2026" bold.  So a word only
+        # decides for itself on strong evidence; otherwise it takes its line's
+        # letter-weighted verdict, and an undecided line is regular (a wrong
+        # bold is the more visible mistake).
+        def _margin(_sc):
+            _r = _sc.get(_font_guess.face_for(_fam, False))
+            _b = _sc.get(_font_guess.face_for(_fam, True))
+            return None if _r is None or _b is None else _b - _r
+        _wsum = _wn = 0.0
+        for _it in _row_items:
+            _m = _margin(_it.get('_fg') or {})
+            if _m is not None:
+                _n = _alnum_n(_it['text']); _wsum += _m * _n; _wn += _n
+        _line_bold = (_wsum / _wn > 0.05) if _wn else None
+        for _it in _row_items:
+            _m = _margin(_it.get('_fg') or {})
+            if _m is not None and abs(_m) >= 0.25:
+                _bold = _m > 0
+            elif _line_bold is not None:
+                _bold = _line_bold
+            else:
+                _bold = _it['rl_font'].endswith('-Bold')
+            _rl = _font_guess.face_for(_fam, _bold)
+            _em = None
+            try:
+                _em = _font_guess.em_px(_it.get('_ink'), _it['text'], _rl)
+            except Exception:
+                logger.debug('[FONT_GUESS] em failed', exc_info=True)
+            if _em:
+                _it['font_size'] = round(_em / scale, 3)
+            elif _rl != _it['rl_font']:
+                _ratio = (_ocr_box_ratio(_it['text'], _rl) or _cap_ratio(_rl))
+                _it['font_size'] = round(_it['_vis_pt'] / _ratio, 3)
+            _it['rl_font'] = _rl
+            # Baseline: the box bottom is the lowest INK, which for a word with
+            # descenders is below the line it sits on.  'descent' is in the
+            # upright (display) frame; on a rotated page
+            # _orient_text_items_for_display re-applies it after orienting.
+            try:
+                _dpt = _font_guess.descent_px(_it.get('_ink'), _it['text'], _rl) / scale
+            except Exception:
+                _dpt = 0.0
+            if _dpt > 0:
+                _it['descent'] = round(_dpt, 3)
+                _it['baseline_y'] = round(_it['y'] + _dpt, 3)
+    for _it in items:
+        _it.pop('_fg', None)
+        _it.pop('_vis_pt', None)
+        _it.pop('_ink', None)
+    logger.info('[FONT_GUESS] page family %s; %s', _page_fam,
+                ', '.join('%s=%d' % (k, v) for k, v in sorted(
+                    __import__('collections').Counter(i['rl_font'] for i in items).items())))
+
     _row_consensus = {}
     for _row_key, _row_items in _rows.items():
         _votes = [_it['font_size'] for _it in _row_items if _is_voter(_it)]
@@ -1199,6 +1318,12 @@ def ocr_extract_text_items(pdf_bytes, scale=None, progress_cb=None):
     for _it in items[:3]:
         logger.debug(f"[OCR_COORDS]   '{_it['text'][:40]}': x={_it['x']:.1f} y={_it['y']:.1f} "
                      f"x2={_it['x2']:.1f} y2={_it['y2']:.1f}")
+
+    _lap('post')
+    logger.info('[OCR_TIMING] %s total=%.2fs items=%d px=%dx%d scale=%.2f lang=%s',
+                ' '.join(f'{k}={v:.2f}s' for k, v in _tm.items()),
+                _time.perf_counter() - _t0, len(items), img.width, img.height,
+                float(scale), _olang)
 
     # Store the canonical result (bounded LRU) and hand back a fresh copy.
     with _OCR_CACHE_LOCK:
@@ -1927,7 +2052,7 @@ def _same_line_neighbour_x(orig, elements, skip_ids):
     return best
 
 
-def _fit_to_available(text, size, rl_font, x, limit_x, min_x2=None):
+def _fit_to_available(text, size, rl_font, x, limit_x, min_x2=None, measure=None):
     """(size, tz, overflows) for rendering *text* inside limit_x.
 
     Returns the original size and no scaling whenever the text already fits —
@@ -1946,7 +2071,10 @@ def _fit_to_available(text, size, rl_font, x, limit_x, min_x2=None):
     # reads "StatementNo:" — the complaint in a different costume.  So keep as
     # much of the gap the original left as a space in this font would occupy.
     keep = _FIT_GAP_PTS
-    space = _font_assets.string_width(rl_font, ' ', size) or size * 0.25
+    # *measure* (text, size) -> width, for text set in the DOCUMENT'S own font
+    # (_NativeFont), whose widths are not in any bundled face.
+    _sw = measure or (lambda t, sz: _font_assets.string_width(rl_font, t, sz))
+    space = _sw(' ', size) or size * 0.25
     if min_x2 is not None:
         trailing = limit_x - float(min_x2)
         if trailing > 0:
@@ -1960,7 +2088,7 @@ def _fit_to_available(text, size, rl_font, x, limit_x, min_x2=None):
     # page worse than it already was.
     if min_x2 is not None:
         avail = max(avail, float(min_x2) - x)
-    natural = _font_assets.string_width(rl_font, text, size)
+    natural = _sw(text, size)
     if avail <= 0:
         # Nowhere to put it at all; squashing to nothing would be worse.
         return size, 100.0, natural > 0
@@ -1974,6 +2102,219 @@ def _fit_to_available(text, size, rl_font, x, limit_x, min_x2=None):
     # Condensing alone is not enough — take the rest out of the font size.
     scale = max(_FIT_MIN_SCALE, target / (natural * (tz / 100.0)))
     return size * scale, tz, (natural * (tz / 100.0) * scale) > avail + 0.5
+
+
+# ── Reusing the document's OWN font for a replacement ───────────────────────
+#
+# A bundled lookalike is a guess.  When the page's own embedded font can draw
+# every character of the replacement, setting the new words in THAT font is
+# not a guess at all: same face, same weight, same widths — which is what
+# Acrobat does.  Drawing-office PDFs (Century Gothic title blocks, A816-08-43-
+# 4391_01) embed a subset with only the glyphs the page uses, so this is
+# checked per edit and falls back to the bundled lookalike when a glyph is
+# missing.  Simple (single-byte) fonts only; a Type0/CID font, a Type3 font or
+# one we cannot map from Unicode is left to the fallback.
+
+_NATIVE_SIMPLE_SUBTYPES = ('/TrueType', '/Type1', '/MMType1')
+_TOUNI_PAIR  = re.compile(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>')
+_TOUNI_RANGE = re.compile(rb'<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<[0-9A-Fa-f]+>|\[[^\]]*\])')
+
+
+def _norm_font_name(name):
+    n = str(name or '').lstrip('/')
+    if '+' in n[:8]:
+        n = n.split('+', 1)[1]
+    return re.sub(r'[^a-z0-9]', '', n.lower())
+
+
+def _utf16_hex(h):
+    try:
+        return bytes.fromhex(h.decode() if isinstance(h, bytes) else h).decode('utf-16-be')
+    except Exception:
+        return None
+
+
+def _parse_to_unicode(data):
+    """{code: unicode string} from a ToUnicode CMap (bfchar + bfrange)."""
+    out = {}
+    for blk in re.findall(rb'beginbfchar(.*?)endbfchar', data, re.S):
+        for a, b in _TOUNI_PAIR.findall(blk):
+            u = _utf16_hex(b)
+            if u is not None:
+                out[int(a, 16)] = u
+    for blk in re.findall(rb'beginbfrange(.*?)endbfrange', data, re.S):
+        for a, b, dst in _TOUNI_RANGE.findall(blk):
+            lo, hi = int(a, 16), int(b, 16)
+            if hi - lo > 0xFFFF:
+                continue
+            if dst.startswith(b'['):
+                for i, h in enumerate(re.findall(rb'<([0-9A-Fa-f]+)>', dst)):
+                    u = _utf16_hex(h)
+                    if u is not None:
+                        out[lo + i] = u
+            else:
+                base = _utf16_hex(dst[1:-1])
+                if not base:
+                    continue
+                for i, code in enumerate(range(lo, hi + 1)):
+                    out[code] = base[:-1] + chr(ord(base[-1]) + i)
+    return out
+
+
+class _NativeFont:
+    """A simple font already on the page, usable for new text when it has
+    every glyph the text needs."""
+
+    def __init__(self, ref, uni_to_code, widths, first_char, missing_w):
+        self.ref = ref
+        self.uni_to_code = uni_to_code
+        self.widths = widths
+        self.first_char = first_char
+        self.missing_w = missing_w
+        self.res_name = None
+
+    # -- discovery ----------------------------------------------------------
+    @classmethod
+    def find(cls, page, font_name):
+        """The font named *font_name* (pdfium's name for the run) among the
+        page's resources and those of its form XObjects, or None."""
+        want = _norm_font_name(font_name)
+        if not want:
+            return None
+        try:
+            for ref, fdict in cls._walk_fonts(page.get('/Resources'), 0, set()):
+                if _norm_font_name(fdict.get('/BaseFont')) == want:
+                    nf = cls._from_dict(ref, fdict)
+                    if nf is not None:
+                        return nf
+        except Exception:
+            logger.debug('[NATIVE_FONT] lookup failed', exc_info=True)
+        return None
+
+    @classmethod
+    def _walk_fonts(cls, res, depth, seen):
+        if res is None or depth > 4:
+            return
+        res = res.get_object()
+        fonts = res.get('/Font')
+        if fonts is not None:
+            fonts = fonts.get_object()
+            for k in fonts:
+                ref = fonts.raw_get(k) if hasattr(fonts, 'raw_get') else fonts[k]
+                yield ref, fonts[k].get_object()
+        xobjs = res.get('/XObject')
+        if xobjs is not None:
+            xobjs = xobjs.get_object()
+            for k in xobjs:
+                xo = xobjs[k].get_object()
+                if id(xo) in seen or xo.get('/Subtype') != '/Form':
+                    continue
+                seen.add(id(xo))
+                yield from cls._walk_fonts(xo.get('/Resources'), depth + 1, seen)
+
+    @classmethod
+    def _from_dict(cls, ref, f):
+        if f.get('/Subtype') not in _NATIVE_SIMPLE_SUBTYPES:
+            return None
+        widths = f.get('/Widths')
+        if widths is None:
+            return None
+        widths = [float(w) for w in widths.get_object()]
+        first = int(f.get('/FirstChar', 0))
+        fd = f.get('/FontDescriptor')
+        fd = fd.get_object() if fd is not None else {}
+        missing = float(fd.get('/MissingWidth', 0) or 0)
+        u2c = {}
+        tu = f.get('/ToUnicode')
+        if tu is not None:
+            for code, u in _parse_to_unicode(tu.get_object().get_data()).items():
+                if 0 <= code <= 255 and len(u) == 1 and u not in u2c:
+                    u2c[u] = code
+        else:
+            enc = f.get('/Encoding')
+            enc = enc.get_object() if enc is not None else None
+            if enc != '/WinAnsiEncoding':
+                return None          # an encoding we would have to guess at
+            for code in range(32, 256):
+                try:
+                    u = bytes([code]).decode('cp1252')
+                except UnicodeDecodeError:
+                    continue
+                u2c.setdefault(u, code)
+        if not u2c:
+            return None
+        return cls(ref, u2c, widths, first, missing)
+
+    # -- use ----------------------------------------------------------------
+    def _w(self, code):
+        i = code - self.first_char
+        if 0 <= i < len(self.widths):
+            return self.widths[i]
+        return self.missing_w
+
+    def can_draw(self, text):
+        """Every character mapped, with a real advance (a subset keeps the
+        code slots of glyphs it dropped, at width 0).  A space it lacks is
+        fine: it becomes a positioning gap (see tj_items)."""
+        if not text:
+            return False
+        for ch in text:
+            if ch == ' ' and ' ' not in self.uni_to_code:
+                continue
+            code = self.uni_to_code.get(ch)
+            if code is None or (ch != ' ' and self._w(code) <= 0):
+                return False
+        return True
+
+    def _space_units(self):
+        code = self.uni_to_code.get(' ')
+        return self._w(code) if code is not None else 278.0
+
+    def width(self, text, size):
+        total = 0.0
+        for ch in text:
+            code = self.uni_to_code.get(ch)
+            total += self._w(code) if code is not None else (
+                self._space_units() if ch == ' ' else 0.0)
+        return total / 1000.0 * size
+
+    def tj_items(self, text):
+        """TJ array body: hex strings, with an unmapped space turned into a
+        negative adjustment of one space's width."""
+        parts, buf = [], bytearray()
+        for ch in text:
+            code = self.uni_to_code.get(ch)
+            if code is None and ch == ' ':
+                if buf:
+                    parts.append('<%s>' % buf.hex()); buf = bytearray()
+                parts.append('%d' % -round(self._space_units()))
+            else:
+                buf.append(code)
+        if buf:
+            parts.append('<%s>' % buf.hex())
+        return ' '.join(parts)
+
+    def resource_name(self, page):
+        """Name the font is reachable by from the PAGE's own /Font dict (our
+        injected block runs at page level), adding it there if it lived only
+        inside a form XObject."""
+        if self.res_name:
+            return self.res_name
+        res = page['/Resources'].get_object()
+        if '/Font' not in res:
+            res[NameObject('/Font')] = DictionaryObject()
+        fonts = res['/Font'].get_object()
+        target = self.ref.get_object()
+        for k in fonts:
+            if fonts[k].get_object() is target:
+                self.res_name = k
+                return k
+        i = 1
+        while '/PWNF%d' % i in fonts:
+            i += 1
+        self.res_name = '/PWNF%d' % i
+        fonts[NameObject(self.res_name)] = self.ref
+        return self.res_name
 
 
 def _rl_to_basefont(rl_font):
@@ -2142,6 +2483,8 @@ def _filter_covered_text_items(text_items, covered_bboxes, merge_regions=None):
 
     THRESH = GHOST_OVERLAP_THRESH
     kept, removed = [], []
+    # (covered entry, text) -> kept items that passed as "the injection".
+    _inj_groups = {}
 
     def _centre_in_merge_region(cx, cy):
         for rx1, ry1, rx2, ry2 in merge_regions:
@@ -2189,14 +2532,17 @@ def _filter_covered_text_items(text_items, covered_bboxes, merge_regions=None):
             continue
 
         is_injection = False
+        _inj_b = None
         for b, _f in matching:
             nt = b.get('new_text', '')
             if nt and (item_text == nt or item_text in nt.split()):
                 is_injection = True
+                _inj_b = b
                 break
 
         if is_injection:
             kept.append(item)
+            _inj_groups.setdefault((id(_inj_b), item_text), []).append(item)
             logger.debug(f"[FILTER] KEEP injection '{item_text}' "
                          f"fracs={[round(f,3) for _,f in matching]}")
         else:
@@ -2208,6 +2554,20 @@ def _filter_covered_text_items(text_items, covered_bboxes, merge_regions=None):
             logger.debug(f"[FILTER] DROP '{item_text}' at "
                          f"({item.get('x',0):.1f},{item.get('y',0):.1f}) "
                          f"fracs={[round(f,3) for _,f in matching]} reason={tag}")
+
+    # A RESTYLE keeps the words, so the painted-over original passes the
+    # "matches new_text" test too, and both runs were offered at the same spot:
+    # clicking there could pick the hidden original, whose (old) style the
+    # panel then showed — "I changed the weight and nothing happened" (v3.4).
+    # The replacement is always appended at the END of the content stream, so
+    # it is the later of the two in extraction order: keep only that one.
+    _drop = set()
+    for _grp in _inj_groups.values():
+        if len(_grp) > 1:
+            _drop.update(id(i) for i in _grp[:-1])
+    if _drop:
+        removed += [i.get('text', '') for i in kept if id(i) in _drop]
+        kept = [i for i in kept if id(i) not in _drop]
 
     logger.debug(f"[FILTER] done: {len(text_items)} → {len(kept)} "
                  f"(removed {len(removed)}: {removed})")
@@ -2775,6 +3135,16 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
                 _txt_display_to_raw(_mv)
         for _og in orig_map.values():
             if _og.get('type') == 'text':
+                # Keep the DISPLAY geometry: the min/max corner of the raw box
+                # is not where the text starts once the axes are turned (on
+                # /Rotate 90 it is the glyphs' TOP — an edit came back a whole
+                # line high), and the same-line/fit logic is only meaningful in
+                # the frame the user reads in.
+                try:
+                    _og['_disp'] = {k: float(_og[k]) for k in ('x', 'y', 'x2', 'y2')}
+                    _og['_disp']['baseline_y'] = float(_og.get('baseline_y', _og['y']))
+                except (KeyError, TypeError, ValueError):
+                    pass
                 _txt_display_to_raw(_og)
 
     logger.debug(f"[apply_edits] /Rotate={_ae_rotate} raw={_ae_raw_W:.0f}x{_ae_raw_H:.0f} display={_disp_W:.0f}x{_disp_H:.0f}")
@@ -3002,17 +3372,20 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
     }
     _tm_a, _tm_b, _tm_c, _tm_d = _TM_ROTATION.get(_ae_rotate, (1, 0, 0, 1))
 
-    def emit_text(x, y, text, size, rl_font, color='#000000', tz=100.0):
+    def emit_text(x, y, text, size, rl_font, color='#000000', tz=100.0, native=None):
         inject_id = '%08x' % random.randint(0, 0xFFFFFFFF)
         logger.debug(f"[DBG-EMIT] \"{text}\" size={size:.3f} rl_font={rl_font} "
                      f"x={x:.3f} y={y:.3f} color={color} inject_id={inject_id}")
         # Bundled fonts (Calibri/Arial/Times/Courier via Carlito/Liberation) are
         # embedded as simple TrueType + WinAnsiEncoding so this (text) Tj path is
         # unchanged.  Base-14 logical names fall through to the standard path.
-        fname = _font_assets.ensure_embedded_font(writer, page, rl_font)
-        if fname is None:
-            base  = _rl_to_basefont(rl_font)
-            fname = _ensure_font(writer, page, base)
+        if native is not None:
+            fname = native.resource_name(page)
+        else:
+            fname = _font_assets.ensure_embedded_font(writer, page, rl_font)
+            if fname is None:
+                base  = _rl_to_basefont(rl_font)
+                fname = _ensure_font(writer, page, base)
         r, g, b = _hex_to_rgb(color)
         s = _safe_pdf_str(text)
         # Tm sets position and text orientation. The (a,b,c,d) components are a
@@ -3037,7 +3410,8 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
             out.append(('%.2f Tz' % tz).encode())
         out += [
             ('%.6f %.6f %.6f %.6f %.3f %.3f Tm' % (_tm_a, _tm_b, _tm_c, _tm_d, x, y)).encode(),
-            ('(%s) Tj' % s).encode(),
+            (('[%s] TJ' % native.tj_items(text)) if native is not None
+             else ('(%s) Tj' % s)).encode(),
         ]
         if abs(tz - 100.0) > 0.05:
             out.append(b'100 Tz')
@@ -3045,6 +3419,37 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
         return out, inject_id
 
     _emit_inject_ids = {}   # {eid: new inject_id} — populated as emit_text is called
+
+    def _run_anchor(orig):
+        """Raw-space point where a replacement for *orig* starts: its display
+        left edge on its baseline, mapped through the rotation as a POINT."""
+        d = orig.get('_disp')
+        if _ae_rotate and d:
+            return display_to_raw(d['x'], d['baseline_y'])
+        return float(orig['x']), float(orig.get('baseline_y', orig['y']))
+
+    def _native_for(orig, text, wanted):
+        """The document's own font for *orig*, when the user has not asked for
+        another one and it has every glyph *text* needs."""
+        if not wanted or orig.get('ocr') or not orig.get('font'):
+            return None
+        nf = _NativeFont.find(page, orig['font'])
+        if nf is None or not nf.can_draw(text):
+            logger.info('[NATIVE_FONT] %s: %s for "%s" — using %s',
+                        orig.get('id'), 'not reusable' if nf is None
+                        else 'missing glyphs', text[:24], orig.get('rl_font'))
+            return None
+        logger.info('[NATIVE_FONT] %s: reusing %s for "%s"',
+                    orig.get('id'), orig['font'], text[:24])
+        return nf
+
+    # Same-line / fit geometry in the DISPLAY frame (see the _disp stash).
+    _fit_view = {}
+    for _fid, _fog in orig_map.items():
+        if _fog.get('type') == 'text' and _fog.get('_disp') and _ae_rotate:
+            _fit_view[_fid] = {**_fog, **_fog['_disp']}
+        else:
+            _fit_view[_fid] = _fog
 
     # Collect (x, y) emit positions for all items about to be re-injected.
     # _scrub_injections_at_positions uses these to remove old pw_inj blocks from
@@ -3058,6 +3463,8 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
             continue
         _pre_orig = orig_map.get(_pre_eid)
         if _pre_orig and _pre_orig.get('type') == 'text':
+            _target_xys.append(_run_anchor(_pre_orig))
+            # Where a pre-3.4 edit on a rotated page put it (the box corner).
             _target_xys.append((
                 float(_pre_orig['x']),
                 float(_pre_orig.get('baseline_y', _pre_orig['y']))
@@ -3092,12 +3499,17 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
         _use_font = _move_font or change.get('rl_font', orig.get('rl_font', 'Helvetica'))
         logger.debug(f"[TEXT_COLOR_MOVED] id={eid} ocr={orig.get('ocr')} "
                      f"move_color={_move_color!r} → using {_use_color!r}")
+        _mv_text = change.get('text', orig['text'])
+        _mv_native = _native_for(
+            orig, _mv_text,
+            (move.get('_keep_native') or change.get('_keep_native')) and not _move_font)
         _et_lines, _et_id = emit_text(
             float(move['x']), float(move['y']),
-            change.get('text', orig['text']),
+            _mv_text,
             render_size,
             _use_font,
             _use_color,
+            native=_mv_native,
         )
         lines += _et_lines
         _emit_inject_ids[eid] = _et_id
@@ -3145,13 +3557,19 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
         # its neighbour.  Only a MEASURED neighbour constrains it; where the
         # rest of the line is free the text is emitted exactly as before.
         _new_text = change.get('text', orig['text'])
-        _limit_x  = _same_line_neighbour_x(orig, orig_map.values(),
+        _native   = _native_for(orig, _new_text, change.get('_keep_native'))
+        _measure  = (lambda t, sz: _native.width(t, sz)) if _native else None
+        _fo       = _fit_view.get(eid, orig)
+        _limit_x  = _same_line_neighbour_x(_fo, _fit_view.values(),
                                            deleted_ids | set(moved_map))
         _fit_size, _fit_tz, _fit_over = (render_size, 100.0, False)
-        if _limit_x is not None:
+        # A size the user SET is what they get: fitting exists so a longer
+        # replacement at the original size does not run into the next word,
+        # and it quietly undid an explicit "make this 14pt" (v3.4).
+        if _limit_x is not None and not _user_size:
             _fit_size, _fit_tz, _fit_over = _fit_to_available(
-                _new_text, render_size, _use_font_tc, float(orig['x']),
-                _limit_x, orig.get('x2'))
+                _new_text, render_size, _use_font_tc, float(_fo['x']),
+                _limit_x, _fo.get('x2'), measure=_measure)
             if _fit_size != render_size or _fit_tz != 100.0 or _fit_over:
                 logger.info('[FIT] id=%s "%s" %.1fpt → %.1fpt @ %.0f%% '
                             '(x=%.1f limit=%.1f)%s', eid, _new_text[:24],
@@ -3164,13 +3582,15 @@ def apply_edits(pdf_bytes, edits, page_w, page_h, img_counter=0, covered_text_bb
                                      'tz': round(_fit_tz, 1),
                                      'orig_size': round(render_size, 2),
                                      'overflows': bool(_fit_over)}
+        _anc_x, _anc_y = _run_anchor(orig)
         _et_lines, _et_id = emit_text(
-            float(orig['x']), float(orig.get('baseline_y', orig['y'])),
+            _anc_x, _anc_y,
             _new_text,
             _fit_size,
             change.get('rl_font', orig.get('rl_font', 'Helvetica')),
             _use_color,
             _fit_tz,
+            native=_native,
         )
         lines += _et_lines
         _emit_inject_ids[eid] = _et_id
@@ -3645,7 +4065,20 @@ def register_editor_routes(app, sessions, inject_token=None):
     @app.before_request
     def _ensure_heavy_ready():
         if not _INIT_DONE and request.path.startswith(_NEEDS_HEAVY):
+            # The background load is still running (or never started): this
+            # request waits for it.  On a slow machine with on-access scanning
+            # of every DLL that is seconds, so say so in the overlay and log
+            # how long it took — it looks exactly like a slow first OCR.
+            _pid = ''
+            try:
+                _pid = (request.get_json(silent=True) or {}).get('progress_id', '')
+            except Exception:
+                pass
+            _pdf_core.set_progress(_pid, 0, 0, 'Loading the OCR engine…')
+            _t = _time.perf_counter()
             _heavy_init()
+            logger.info('[HEAVY_WAIT] %s waited %.2fs for the OCR/pdfium load',
+                        request.path, _time.perf_counter() - _t)
 
     @app.route('/api/header_footer', methods=['POST'])
     def header_footer_apply():

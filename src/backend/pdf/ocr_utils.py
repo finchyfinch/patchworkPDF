@@ -25,6 +25,27 @@ import contextlib
 logger = logging.getLogger(__name__)
 
 
+_HC_LOCK  = threading.Lock()
+_HC_DEPTH = 0
+_HC_ORIG  = None
+
+
+def _hidden_popen_class(orig_popen):
+    _CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+
+    class _HiddenPopen(orig_popen):
+        def __init__(self, *args, **kwargs):
+            if kwargs.get('startupinfo') is None:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                kwargs['startupinfo'] = si
+            kwargs['creationflags'] = kwargs.get('creationflags', 0) | _CREATE_NO_WINDOW
+            super().__init__(*args, **kwargs)
+
+    return _HiddenPopen
+
+
 @contextlib.contextmanager
 def hidden_console():
     """Suppress the console window a child process (Tesseract) flashes on Windows.
@@ -39,24 +60,24 @@ def hidden_console():
     if sys.platform != 'win32':
         yield
         return
-    _orig_popen = subprocess.Popen
-    _CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
-
-    class _HiddenPopen(_orig_popen):
-        def __init__(self, *args, **kwargs):
-            if kwargs.get('startupinfo') is None:
-                si = subprocess.STARTUPINFO()
-                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                si.wShowWindow = subprocess.SW_HIDE
-                kwargs['startupinfo'] = si
-            kwargs['creationflags'] = kwargs.get('creationflags', 0) | _CREATE_NO_WINDOW
-            super().__init__(*args, **kwargs)
-
-    subprocess.Popen = _HiddenPopen
+    # Reference-counted (v3.4): OCR now runs Tesseract from several threads at
+    # once (the two passes in parallel, two requests overlapping).  A plain
+    # save/patch/restore lets one thread "restore" another's patch — leaving
+    # Popen patched for good, or un-patched while a child is still starting.
+    global _HC_DEPTH, _HC_ORIG
+    with _HC_LOCK:
+        if _HC_DEPTH == 0:
+            _HC_ORIG = subprocess.Popen
+            subprocess.Popen = _hidden_popen_class(_HC_ORIG)
+        _HC_DEPTH += 1
     try:
         yield
     finally:
-        subprocess.Popen = _orig_popen
+        with _HC_LOCK:
+            _HC_DEPTH -= 1
+            if _HC_DEPTH == 0 and _HC_ORIG is not None:
+                subprocess.Popen = _HC_ORIG
+                _HC_ORIG = None
 
 # Lazy-loaded heavy deps
 _pytesseract = None
@@ -552,26 +573,95 @@ def _accept_reread(orig, orig_conf, reread, reread_conf):
     return None
 
 
-def _reread_word(gray_arr, w, lang, cfg):
-    """(text, min_conf) from a single-line read of *w*'s crop, flipped to
-    dark-on-light and upscaled."""
+def _reread_image(gray_arr, w):
+    """*w*'s crop flipped to dark-on-light, upscaled and padded — what the
+    single-line re-read is given — or None for an empty crop."""
     pad = max(4, int(w['height']) // 2)
     t0, l0 = max(0, int(w['top']) - pad), max(0, int(w['left']) - pad)
     crop = gray_arr[t0:int(w['top']) + int(w['height']) + pad,
                     l0:int(w['left']) + int(w['width']) + pad]
     if crop.size == 0:
-        return '', -1
+        return None
     im = _PILImage.fromarray(255 - crop)
     im = im.resize((im.width * 2, im.height * 2), _PILImage.LANCZOS)
-    im = _PILImage.fromarray(_np.pad(_np.asarray(im), 20, constant_values=255))
-    with hidden_console():
-        d = _pytesseract.image_to_data(im, output_type=_pytesseract.Output.DICT,
-                                       lang=lang, config='--psm 7' + cfg)
+    return _PILImage.fromarray(_np.pad(_np.asarray(im), 20, constant_values=255))
+
+
+def _reread_result(d):
+    """(text, min_conf) from one image's image_to_data dict."""
     toks = [(t.strip(), int(c)) for t, c in zip(d['text'], d['conf'])
             if t and t.strip() and int(c) >= 0]
     if not toks:
         return '', -1
     return ' '.join(t for t, _ in toks), min(c for _, c in toks)
+
+
+def _reread_word(gray_arr, w, lang, cfg):
+    """(text, min_conf) from a single-line read of *w*'s crop, flipped to
+    dark-on-light and upscaled.  One Tesseract process per word — kept as the
+    fallback for _reread_batch."""
+    im = _reread_image(gray_arr, w)
+    if im is None:
+        return '', -1
+    with hidden_console():
+        d = _pytesseract.image_to_data(im, output_type=_pytesseract.Output.DICT,
+                                       lang=lang, config='--psm 7' + cfg)
+    return _reread_result(d)
+
+
+def _reread_batch(images, lang, cfg):
+    """[(text, min_conf), ...] for *images*, read in ONE Tesseract process.
+
+    Every Tesseract launch pays a fixed start-up (load the program, load the
+    language data) — and on a PC whose security software inspects each launch
+    that cost dominates: a work laptop spent 7.6s re-reading the white-on-dark
+    words of one invoice header, one process per word (v3.4 field log).
+    Tesseract takes a text file listing images and reads each one as its own
+    PAGE, so one launch covers them all.
+
+    Nothing about the read changes: the images are saved exactly as
+    pytesseract saves them (PNG), with the same arguments (`--psm 7`, language,
+    config), and the bundled language data is LSTM-only (tessdata_fast), which
+    carries no adaptation from one page to the next — so each page reads as it
+    would have alone.  Pinned by tests/test_ocr_speedups.py.
+
+    Raises on anything unexpected; the caller falls back to one process per
+    word, so a batch failure costs time, never a result.
+    """
+    import tempfile, shlex
+    pt = _pytesseract.pytesseract
+    with tempfile.TemporaryDirectory(prefix='pw_reread_') as td:
+        names = []
+        for i, im in enumerate(images):
+            n = 'w%04d.png' % i
+            im.save(os.path.join(td, n), format='PNG')
+            names.append(n)
+        with open(os.path.join(td, 'list.txt'), 'w', encoding='ascii') as f:
+            f.write('\n'.join(names) + '\n')
+        # Relative names + cwd: a list file with a non-ASCII temp path (user
+        # name) is the one thing Tesseract's list reader might not cope with.
+        args = [pt.tesseract_cmd, 'list.txt', 'out', '-l', lang]
+        args += shlex.split('-c tessedit_create_tsv=1 --psm 7' + cfg,
+                            posix=(sys.platform != 'win32'))
+        kw = pt.subprocess_args()
+        kw['cwd'] = td
+        with hidden_console():
+            proc = subprocess.Popen(args, **kw)
+            _out, err = proc.communicate(timeout=max(60, 5 * len(images)))
+        if proc.returncode:
+            raise RuntimeError('tesseract batch failed: %r' % (err or b'')[:200])
+        with open(os.path.join(td, 'out.tsv'), 'rb') as f:
+            tsv = f.read().decode('utf-8')
+    d = pt.file_to_dict(tsv, '\t', -1)
+    pages = d.get('page_num', [])
+    per = [{'text': [], 'conf': []} for _ in images]
+    for k, pg in enumerate(pages):
+        i = int(pg) - 1
+        if not 0 <= i < len(per):
+            raise RuntimeError('tesseract batch: unexpected page %r' % pg)
+        per[i]['text'].append(d['text'][k])
+        per[i]['conf'].append(d['conf'][k])
+    return [_reread_result(x) for x in per]
 
 
 def reread_light_on_dark(gray_arr, words, lang, cfg=''):
@@ -586,16 +676,29 @@ def reread_light_on_dark(gray_arr, words, lang, cfg=''):
     if not cands:
         return 0
     cands = cands[:_REREAD_MAX_WORDS]
-    from concurrent.futures import ThreadPoolExecutor
+    results = None
+    try:
+        imgs = [_reread_image(gray_arr, w) for w in cands]
+        live = [i for i, im in enumerate(imgs) if im is not None]
+        got = _reread_batch([imgs[i] for i in live], lang, cfg) if live else []
+        results = [('', -1)] * len(cands)
+        for i, r in zip(live, got):
+            results[i] = r
+    except Exception:
+        logger.warning('[OCR] batched re-read failed; re-reading word by word',
+                       exc_info=True)
+        results = None
+    if results is None:
+        from concurrent.futures import ThreadPoolExecutor
 
-    def _one(w):
-        try:
-            return _reread_word(gray_arr, w, lang, cfg)
-        except Exception:
-            return '', -1
+        def _one(w):
+            try:
+                return _reread_word(gray_arr, w, lang, cfg)
+            except Exception:
+                return '', -1
 
-    with ThreadPoolExecutor(max_workers=_REREAD_WORKERS) as ex:
-        results = list(ex.map(_one, cands))
+        with ThreadPoolExecutor(max_workers=_REREAD_WORKERS) as ex:
+            results = list(ex.map(_one, cands))
     changed = 0
     for w, (txt, conf) in zip(cands, results):
         fixed = _accept_reread(w['text'], int(w.get('conf', 0)), txt, conf)
@@ -642,6 +745,65 @@ OCR_STAGE_PREP      = (2, 'Preparing image…')
 OCR_STAGE_PASS1     = (3, 'Recognising text (pass 1 of 2)…')
 OCR_STAGE_PASS2     = (4, 'Recognising text (pass 2 of 2)…')
 OCR_STAGE_FINALISE  = (5, 'Finalising text…')
+
+
+def run_two_passes(ocr_img, lang, cfg, progress_cb=None):
+    """(data1, data2): the page-level psm 6 and psm 11 reads, run CONCURRENTLY.
+
+    They are independent Tesseract processes over the same image, so running
+    them side by side gives byte-identical results in roughly the time of the
+    longer one instead of the sum (v3.4).  Progress still reports both stages:
+    pass 2 is announced when pass 1 lands.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    report_ocr_progress(progress_cb, OCR_STAGE_PASS1)
+    with hidden_console():
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix='ocr-pass') as ex:
+            f1 = ex.submit(_pytesseract.image_to_data, ocr_img,
+                           output_type=_pytesseract.Output.DICT,
+                           lang=lang, config='--psm 6' + cfg)
+            f2 = ex.submit(_pytesseract.image_to_data, ocr_img,
+                           output_type=_pytesseract.Output.DICT,
+                           lang=lang, config='--psm 11' + cfg)
+            data1 = f1.result()
+            report_ocr_progress(progress_cb, OCR_STAGE_PASS2)
+            data2 = f2.result()
+    return data1, data2
+
+
+_WARMED = False
+
+
+def warm_up_ocr():
+    """Run one tiny OCR on a background thread so the FIRST real read does not
+    pay Tesseract's cold start.
+
+    The first launch of the day loads tesseract.exe, its DLLs and the language
+    data from disk — and security software scans each of them — so pass 1 of
+    the first page took 6.2s on a work laptop where pass 2, the same work a
+    moment later, took 2.7s.  Doing a throwaway read right after start-up moves
+    that cost to a moment nobody is waiting.  No-op when OCR is unavailable
+    (Tesseract is an optional install) or already warmed; never raises.
+    """
+    global _WARMED
+    if _WARMED or not is_ocr_available() or _pytesseract is None or _PILImage is None:
+        return
+    _WARMED = True
+
+    def _go():
+        import time as _t
+        t0 = _t.perf_counter()
+        try:
+            lang, cfg = ocr_lang_config()
+            im = _PILImage.new('L', (160, 48), 255)
+            with hidden_console():
+                _pytesseract.image_to_data(im, output_type=_pytesseract.Output.DICT,
+                                           lang=lang, config='--psm 7' + cfg)
+            logger.info('[OCR_WARMUP] Tesseract warmed in %.2fs', _t.perf_counter() - t0)
+        except Exception as exc:
+            logger.info('[OCR_WARMUP] skipped: %s', exc)
+
+    threading.Thread(target=_go, daemon=True, name='ocr-warmup').start()
 
 
 def report_ocr_progress(progress_cb, stage):
@@ -825,16 +987,8 @@ def ocr_page_words(pdf_bytes, scale=None, progress_cb=None):
         # ── Two-pass OCR ──────────────────────────────────────────────────────
         # Pass 1 (psm 6): layout-aware, reliable block/par/line hierarchy
         # Pass 2 (psm 11): sparse text, catches isolated words psm 6 misses
-        with hidden_console():
-            _olang, _ocfg = ocr_lang_config()
-            report_ocr_progress(progress_cb, OCR_STAGE_PASS1)
-            data1 = _pytesseract.image_to_data(
-                ocr_img, output_type=_pytesseract.Output.DICT,
-                lang=_olang, config='--psm 6' + _ocfg)
-            report_ocr_progress(progress_cb, OCR_STAGE_PASS2)
-            data2 = _pytesseract.image_to_data(
-                ocr_img, output_type=_pytesseract.Output.DICT,
-                lang=_olang, config='--psm 11' + _ocfg)
+        _olang, _ocfg = ocr_lang_config()
+        data1, data2 = run_two_passes(ocr_img, _olang, _ocfg, progress_cb)
 
         report_ocr_progress(progress_cb, OCR_STAGE_FINALISE)
 

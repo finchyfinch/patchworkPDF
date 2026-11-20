@@ -423,26 +423,49 @@ window.addEventListener('load', function () { bootMark('window load event'); });
           <div class="at-note" data-i18n="at_edittext_props.hint">
             Click any of the document's own text to select it. Double-click or Enter to change the words, drag to move, Del to remove. Right-click for Row / area to edit several words or lines as one paragraph.
           </div>
-          <div class="at-ctrl-row">
-            <span class="at-ctrl-lbl" data-i18n="at_edittext_props.selected">Selected</span>
+          <!-- Label above, words below: a fixed-width inline label let longer
+               labels ("Selected", "Sélectionné") run under the selected text. -->
+          <div class="at-et-sel-row">
+            <span class="at-et-sel-lbl" data-i18n="at_edittext_props.selected">Selected text:</span>
             <span id="at-et-selected" class="at-et-sel"></span>
+          </div>
+          <!-- Font + weight (v3.4).  "Document font" keeps the words in the
+               PDF's own embedded font where it has the glyphs; picking a font
+               or changing Bold/Italic switches to a bundled face. -->
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="annot_tools.font">Font</span>
+            <select class="at-sel" id="at-et-font" onchange="editTextStyleChanged()" title="Font for the selected text" data-i18n-attr="title:at_edittext_props.font_tip">
+              <option value="" id="at-et-font-doc" data-i18n="at_edittext_props.font_doc">Document font</option>
+              <option value="Calibri" data-i18n="ml_font.calibri">Calibri</option>
+              <option value="Arial" data-i18n="ml_font.arial">Arial</option>
+              <option value="TimesNR" data-i18n="ml_font.times_new_roman">Times New Roman</option>
+              <option value="CourierNew" data-i18n="ml_font.courier_new">Courier New</option>
+            </select>
+          </div>
+          <div class="at-ctrl-row at-et-weight">
+            <span class="at-ctrl-lbl"></span>
+            <label class="at-et-tog"><input type="checkbox" id="at-et-bold" onchange="editTextStyleChanged()"> <b data-i18n="at_edittext_props.bold">Bold</b></label>
+            <label class="at-et-tog"><input type="checkbox" id="at-et-italic" onchange="editTextStyleChanged()"> <i data-i18n="at_edittext_props.italic">Italic</i></label>
           </div>
           <div class="at-ctrl-row">
             <span class="at-ctrl-lbl" data-i18n="ed_tools.text">Text</span>
             <label class="at-field" title="Text size" data-i18n-attr="title:ed_tools.text_size_tip">
               <span class="at-field-lbl" data-i18n="ed_tools.size">Size</span>
-              <input class="at-num" id="at-et-size" type="number" min="4" max="96" placeholder="—">
+              <input class="at-num" id="at-et-size" type="number" min="4" max="400" step="0.1" placeholder="—" onchange="editTextStyleChanged()">
             </label>
             <label class="at-field at-field-color" title="Text colour" data-i18n-attr="title:ed_tools.text_colour_tip">
               <span class="at-field-lbl" data-i18n="ed_tools.colour">Colour</span>
-              <input class="at-color" id="at-et-color" type="color" value="#000000">
+              <input class="at-color" id="at-et-color" type="color" value="#000000" onchange="editTextStyleChanged()">
             </label>
           </div>
           <div style="display:flex;gap:6px">
-            <button class="btn btn-ghost" style="flex:1;font-size:12px;justify-content:center" onclick="editTextRestyleSelected()" data-i18n="at_edittext_props.restyle">Apply style</button>
             <button class="btn btn-ghost" id="at-et-delete" style="flex:1;font-size:12px;justify-content:center" onclick="editTextDeleteSelected()" disabled data-i18n="at_edittext_props.delete">Delete</button>
           </div>
           <button class="btn btn-ghost" id="at-et-block" style="width:100%;font-size:12px;justify-content:center;margin-top:6px" onclick="editTextBlockSelected()" disabled title="Edit the selected word's row — then drag the box to take in more words or lines — as one paragraph" data-i18n="at_edittext_props.block" data-i18n-attr="title:at_edittext_props.block_tip">Row / area</button>
+          <!-- v3.4: OCR a native page's pictures (screenshots, scanned logos)
+               so their words can be edited too.  Shown only when Tesseract is
+               installed and nothing on the page has been OCR'd yet. -->
+          <button class="btn btn-ghost" id="at-et-readimg" style="width:100%;font-size:12px;justify-content:center;margin-top:6px;display:none" onclick="editTextReadImages()" title="Find the words inside pictures on this page so they can be edited as well. The page's own text is kept as it is." data-i18n="at_edittext_props.read_images" data-i18n-attr="title:at_edittext_props.read_images_tip">Read text in images</button>
         </div>
 
         <!-- Page-text style (shown while either page-text tool is armed).
@@ -1052,7 +1075,7 @@ window.addEventListener('load', function () { bootMark('window load event'); });
     <div class="pmodal-range">
       <input type="text" id="print-range" placeholder="e.g. 1, 3, 10-12"
              autocomplete="off" spellcheck="false"
-             oninput="_printRangeInput()" onfocus="_printSetMode('custom')" data-i18n-attr="placeholder:print_range.e_g_1_3_ph">
+             oninput="_printRangeInput()" onfocus="_printRangeActivate()" readonly data-i18n-attr="placeholder:print_range.e_g_1_3_ph">
       <div class="pmodal-error" id="print-range-error"></div>
     </div>
 
@@ -1281,6 +1304,15 @@ window.addEventListener('load', function () { bootMark('window load event'); });
 
 <!-- Context Menu — acts on the single right-clicked page (bulk actions are in the toolbar) -->
 <div id="context-menu">
+  <div class="menu-item" onclick="contextOpenInViewer()" data-i18n="context_menu.open_in_viewer">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+    Open in viewer at this page
+  </div>
+  <div class="menu-item" onclick="contextSplitFromHere()" data-i18n="context_menu.split_from_here">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
+    Split document from here
+  </div>
+  <div class="menu-divider"></div>
   <div class="menu-label" data-i18n="context_menu.rotate">Rotate</div>
   <div class="menu-item" onclick="contextRotate(90)" data-i18n="context_menu.rotate_90_cw">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38"/></svg>
@@ -1705,9 +1737,26 @@ window.addEventListener('load', function () { bootMark('window load event'); });
 <div id="whats-new-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10003;align-items:center;justify-content:center">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px 24px 18px;max-width:520px;width:92%;box-shadow:0 24px 64px rgba(0,0,0,.5);max-height:82vh;overflow-y:auto">
     <div style="font-size:16px;font-weight:600;margin-bottom:4px;color:var(--text)" data-i18n="whats_new.title">What's new in this version</div>
-    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px" data-i18n="whats_new.subtitle">Version 3.3 opens faster and uses less memory.</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px" data-i18n="whats_new.subtitle">Version 3.4 makes printing, editing text and moving between pages smoother.</div>
 
     <div style="font-size:13px;color:var(--text);line-height:1.65">
+      <ul style="margin:0 0 14px 18px;padding:0">
+        <li data-i18n="whats_new.v34_item_print">Print: click in the page-range box and Custom is selected for you, ready to type the pages you want.</li>
+        <li data-i18n="whats_new.v34_item_ctrlp">Ctrl+P now reliably opens Print — including straight after the Open or Save dialog, or after printing.</li>
+        <li data-i18n="whats_new.v34_item_edittext">Edit text: a scanned page is read as soon as you choose the tool, with a progress bar, so your first click on a word works straight away.</li>
+        <li data-i18n="whats_new.v34_item_ocrspeed">Edit text reads scanned pages faster (OCR), with exactly the same results — most noticeable on slower PCs.</li>
+        <li data-i18n="whats_new.v34_item_thumbs">Clicking a thumbnail far from the current page now goes to that page, not the one before it.</li>
+        <li data-i18n="whats_new.v34_item_drag">Thumbnails in the page list can no longer be dragged by mistake. To reorder pages, use Layout.</li>
+        <li data-i18n="whats_new.v34_item_selected">Edit text: the selected words now have their own line in the Tools panel instead of overlapping the label.</li>
+        <li data-i18n="whats_new.v34_item_docfont">Edit text keeps the document's own font and weight, and lines edited words up exactly — including on rotated drawings.</li>
+        <li data-i18n="whats_new.v34_item_fontctl">Edit text panel: see and change the selected word's font, size, bold and italic.</li>
+        <li data-i18n="whats_new.v34_item_livestyle">Edit text: font, bold, italic, size and colour now change the selected word straight away — also while you are typing.</li>
+        <li data-i18n="whats_new.v34_item_readimages">Edit text: 'Read text in images' lets you edit words inside pictures on a page, such as screenshots and logos. The page's own text is kept as it is.</li>
+        <li data-i18n="whats_new.v34_item_ocrfont">Edits to scanned text and text in images now match the original font, weight, size and line much more closely.</li>
+        <li data-i18n="whats_new.v34_item_layoutctx">Layout: right-click a page to open the viewer at that page, or to split the document from there into a new tab.</li>
+      </ul>
+      <!-- The 3.3 note stays, for anyone skipping straight from 3.2. -->
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:0 0 6px" data-i18n="whats_new.v33_heading">From version 3.3: it opens faster and uses less memory.</div>
       <ul style="margin:0 0 14px 18px;padding:0">
         <li data-i18n="whats_new.v33_item_speed">Faster start-up, especially when you double-click a PDF to open it.</li>
         <li data-i18n="whats_new.v33_item_memory">Uses much less memory: up to around 700 MB less on PCs with many processor cores.</li>
