@@ -72,7 +72,9 @@ def test_prefs_are_defined_before_i18n_js_runs(client):
 
 def test_nothing_saved_means_null_so_page_defaults_apply(client):
     prefs, _ = _page_prefs(client)
-    assert prefs == {'theme': None, 'lang': None, 'os_lang': None}   # os_lang: macOS only
+    # os_lang is the OS language list (NSLocale) - only macOS has one, so on
+    # a Mac it is legitimately set; elsewhere it is None.
+    assert prefs == {'theme': None, 'lang': None, 'os_lang': i18n_py.os_lang()}
 
 
 def test_the_saved_language_is_handed_to_the_page(client):
