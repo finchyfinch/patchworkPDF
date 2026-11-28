@@ -543,13 +543,26 @@ function _setActivePanel(panelId) {
 // true when a document is available afterwards, false when there genuinely
 // isn't one.  Safe to call repeatedly — it is a no-op once the viewer is
 // already on that session.
+//
+// Layout's `sessionId` is only LIVE while Layout is showing (switchToLayout
+// re-syncs it on entry).  Opening or switching tabs moves the viewer's
+// SESSION_ID and leaves Layout's id on whatever it last held, so a mismatch
+// with the viewer in front does NOT mean "Layout has a document the viewer
+// hasn't seen" — it means Layout is stale.  Adopting it then hijacked the
+// active tab: double-click a second PDF, press Ctrl+P, and the first document
+// was loaded into the new tab and printed (v3.5).  So adopt only when the viewer
+// has no document of its own, or Layout is the panel in front.
+function _layoutPanelShowing() {
+  const el = (typeof document !== 'undefined' && document.getElementById)
+    ? document.getElementById('panel-layout') : null;
+  return !!(el && el.style && el.style.display === 'flex');
+}
+
 async function adoptLayoutDocument(atPageId) {
   const layoutSid = (typeof sessionId !== 'undefined') ? sessionId : null;
-  const alreadyOurs = SESSION_ID && (!layoutSid || layoutSid === SESSION_ID);
-  if (alreadyOurs && typeof allPages !== 'undefined' && allPages.length) return true;
-  if (!layoutSid || layoutSid === SESSION_ID) {
-    return (typeof allPages !== 'undefined' && allPages.length > 0);
-  }
+  const hasPages  = () => (typeof allPages !== 'undefined' && allPages.length > 0);
+  if (SESSION_ID && !_layoutPanelShowing()) return hasPages();
+  if (!layoutSid || layoutSid === SESSION_ID) return hasPages();
 
   SESSION_ID    = layoutSid;
   currentPageId = (typeof atPageId === 'string') ? atPageId : '';

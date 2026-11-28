@@ -30,3 +30,4 @@ reopen.pdf
 Thumbs.db
 .DS_Store
 ~$*
+logfile.log.*

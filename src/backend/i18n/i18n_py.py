@@ -24,7 +24,8 @@ import sys
 # Locate locales/ next to the exe when frozen, else climb from
 # <root>/src/backend/i18n/i18n_py.py to the project <root>.
 if getattr(sys, 'frozen', False):
-    _APP_DIR = os.path.dirname(sys.executable)
+    from platform_io import platform_paths as _pp
+    _APP_DIR = _pp.frozen_data_dir()
 else:
     _APP_DIR = os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))))
@@ -64,6 +65,35 @@ def saved_lang() -> str | None:
         return v if v in SUPPORTED else None
     except OSError:
         return None
+
+
+def os_preferred_languages() -> list[str]:
+    """The OS's own ordered UI-language list, where we can read it reliably.
+
+    macOS only, for now: a WKWebView's navigator.language is not guaranteed to
+    be the user's first language (3.4 opened in German on an English Mac), so
+    the first-run default is taken from NSLocale instead.  Elsewhere returns
+    [] and the page keeps using navigator.language, as before."""
+    if sys.platform != 'darwin':
+        return []
+    try:
+        from Foundation import NSLocale          # pyobjc, bundled for pywebview
+        return [str(x) for x in NSLocale.preferredLanguages()]
+    except Exception:
+        return []
+
+
+def os_lang() -> str | None:
+    """First SUPPORTED language in the OS list, or English if the list was
+    readable but has none of ours, or None when the list is unavailable."""
+    langs = os_preferred_languages()
+    if not langs:
+        return None
+    for tag in langs:
+        code = tag[:2].lower()
+        if code in SUPPORTED:
+            return code
+    return FALLBACK
 
 
 def set_lang(lang: str) -> None:

@@ -38,6 +38,26 @@ def is_flatpak():
     return os.path.exists('/.flatpak-info') or 'FLATPAK_ID' in os.environ
 
 
+# ── Bundled (read-only) app files ─────────────────────────────────────────────
+def frozen_data_dir(executable=None):
+    """Directory holding the files shipped with a FROZEN build — version.json,
+    LICENSE.txt, assets/, locales/, docs/, src/frontend/.
+
+    Windows/Linux cx_Freeze builds put them next to the executable.  A macOS
+    ``.app`` does not: bdist_mac moves them all to ``Contents/Resources`` and
+    leaves ``Contents/MacOS`` holding the executable plus symlinks for the
+    sub-FOLDERS only — so a folder looked up next to the executable is found,
+    but a loose file (LICENSE.txt, version.json) is not.  That is how 3.4 on
+    macOS showed "could not load the license text".  Always resolve here.
+    """
+    exe_dir = os.path.dirname(os.path.abspath(executable or sys.executable))
+    if os.path.basename(exe_dir) == 'MacOS':
+        res = os.path.join(os.path.dirname(exe_dir), 'Resources')
+        if os.path.isdir(res):
+            return res
+    return exe_dir
+
+
 # ── Per-user data directory ───────────────────────────────────────────────────
 def user_data_dir(app_name=APP_FOLDER_NAME):
     """Return (creating if needed) the per-user writable directory for app state

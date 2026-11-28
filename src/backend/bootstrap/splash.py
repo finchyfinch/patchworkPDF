@@ -73,7 +73,8 @@ _keepalive = []
 def _app_dir():
     """Directory holding the bundled assets (mirrors entry.get_app_dir)."""
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        from platform_io import platform_paths
+        return platform_paths.frozen_data_dir()
     # dev: this file is <root>/src/backend/bootstrap/splash.py — climb to <root>.
     return os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))))

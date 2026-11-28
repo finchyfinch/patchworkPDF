@@ -56,6 +56,19 @@ copy — keep it updated when project-wide facts change.
   Restore/verify on any platform with `python tools\fetch_tessdata.py`
   (`--verify` to check only). Windows/macOS bundle them via `setup.py`; the
   Flatpak downloads its own pinned copies. See `assets\tessdata\README.md`.
+- **Shipped files in a frozen build: `platform_paths.frozen_data_dir()`,
+  never `dirname(sys.executable)`.** A macOS `.app` keeps them in
+  `Contents/Resources`; `Contents/MacOS` has the executable plus symlinks to
+  the sub-FOLDERS only, so loose files (LICENSE.txt, version.json) were
+  "missing" on macOS 3.4. `tests/test_frozen_data_dir.py` fails on any new
+  `dirname(sys.executable)` under `src/backend`.
+- **First-run language on macOS comes from NSLocale** (`i18n_py.os_lang`,
+  handed to the page as `PW_PREFS.os_lang`), not WKWebView's
+  `navigator.language` — 3.4 opened in German on an English Mac. Logged as
+  `[LANG] first run: ...`. Once chosen, it is saved in `lang.txt`.
+- **The macOS build ad-hoc signs the whole bundle** (`make_dmg.sh`). cx_Freeze
+  signs each binary but not the `.app`; downloaded, that reads as "damaged and
+  can't be opened" with no override.
 - User state (update prefs, license, recents) lives in
   `%LOCALAPPDATA%\PatchworkPDF\`, not in the project.
 
@@ -451,6 +464,133 @@ object. See `docs/EDITOR_VIEWER_MERGE_PLAN.md` for the whole programme.
   `tests/test_panel_tabs.py`, `tests/test_locales.py` and
   `tests/js/viewer_comment_panel.test.mjs`.
 
+## Text markup on selected text (v3.5)
+
+- **Select text (Pointer marquee) → pop-up `#tm-popup` → Highlight /
+  Underline / StrikeOut / Squiggly.** One annotation per action, ONE QUAD PER
+  LINE (`/QuadPoints`, split at column gaps by `_tmQuadsFromLines`), written by
+  `add_annotation` with `quads` (display frame, PDF y-up) and marked
+  `/PWKind /TextMarkup`. The marked words go in `/Contents` so the Comments list
+  says what was marked. `_groupCharsIntoLines` is shared with copy.
+- **Corners are transformed as POINTS** (`_display_quads_to_raw`), so on a
+  rotated page each quad keeps the text's orientation and the AP
+  (`_generate_text_markup_ap`, drawn from each quad's own along/up vectors)
+  puts an underline under the words as displayed. BBox == Rect in absolute
+  page coords, no /Matrix.
+- **Text markup is SELECTED, never lifted** (`_is_text_markup`: underline /
+  strikeout / squiggly always; a highlight with our marker or >1 quad).
+  `_annot_edit_info` returns `tool: 'textmarkup'` with display-frame `quads`;
+  the client draws padded hit-areas (≥14px — a line at low zoom is a few px and
+  real clicks missed) and a dashed ring. Colour/kind go to
+  `/api/viewer/restyle_text_markup` — same object, same index, same thread, one
+  undo step; refuses non-markup. Delete is `delete_annotation`. The box
+  Highlight tool (no quads) still lifts as a box — scanned pages need it.
+- **A press on markup only NOTES it** (`_tmPending`); `_onViewerMouseUp`
+  selects it only if the press did not become a drag, so already-marked text
+  can still be selected and copied.
+- `_tmSel`/`_tmPending`/`_tmLastColor` are declared with the annotation state
+  near the top of viewer-panel.js: `_resetViewerState`, `applyZoom` and
+  `clearAllSelectionOverlays` read them, and a `let` further down is a TDZ
+  error if any of those runs during load. The pop-up is position:fixed and is
+  put away on scroll, zoom, tab change and arming a tool.
+- Guarded by `tests/test_text_markup.py` (incl. rendered pixels on plain,
+  /Rotate 90 and cropped pages) and `tests/js/viewer_text_markup.test.mjs`.
+
+## Callout tool (v3.5)
+
+- **A callout is the standard FreeText callout**: `/IT /FreeTextCallout`,
+  `/CL` tip -> knee -> end, `/LE /OpenArrow`, and `/RD` = where the text box
+  sits inside the bigger `/Rect` (which covers box + leader + arrowhead).
+  `_callout_geometry_raw` reads box (Rect inset by RD) and tip (first CL point),
+  so another producer's callout lifts too.
+- **The leader rule lives in TWO places and they must agree**: viewer.py
+  `_callout_leader` and viewer-panel.js `_calloutLeader` (end = middle of the
+  box side facing the tip; knee 12pt out). `tests/js/viewer_callout.test.mjs`
+  pins the JS against the same cases `tests/test_callout.py` pins the server.
+- **The appearance is authored upright in the DISPLAY frame** relative to the
+  union box, with `_ap_upright_matrix` on rotated pages (the rotated-text-box
+  mechanism); /Rect, /RD and /CL are the display geometry taken to raw. Box +
+  text come from `_freetext_content`, shared with `_generate_freetext_ap`.
+- **Every callout is markup, never a comment** (`_freetext_is_markup`, used by
+  all three comment-index sites: `_get_annotations`, `update_annotation`,
+  `_annot_edit_info`). A foreign callout has no `/PWKind`; on the comment path
+  its appearance would be regenerated as a plain box and the leader lost.
+- Client: `_isTextBoxTool` (text | callout) shares the inline editor; the
+  draft carries `tx/ty` (tip, block px); handle `'tip'` moves only the tip,
+  `'move'` moves only the box. A callout needs a DRAG (press = tip, release =
+  box): with the tool armed a bare click is how a draft is accepted, and must
+  not start another. Paste moves `callout_tip` with the box.
+- Guarded by `tests/test_callout.py` and `tests/js/viewer_callout.test.mjs`.
+
+## Review stamps (v3.5)
+
+- **A review stamp is a VECTOR `/Stamp`** (`_generate_review_stamp_ap`:
+  rounded frame, label in Helvetica-Bold fitted to the box with the AFM widths
+  in `_HELVETICA_BOLD_W`, optional second line), `/PWKind /RubberStamp`, its
+  text in `/PWStampLabel` / `/PWStampSub` / `/PWStampKey` (what lifting reads)
+  and in `/Contents` (what Acrobat shows). `/Name` is the standard name where
+  one exists (`_STAMP_STD_NAMES`), else `/PW<Key>`.
+- **Image and signature stamps are also `/Stamp` and must stay UNLISTED**
+  (page content, not review). `_listed_stamp` lists ours and any stamp with a
+  `/Name` (Acrobat's). The image and signature tools write no `/Name` — keep
+  it that way, or every inserted picture appears in the Comments list.
+- Fonts carry `/Encoding /WinAnsiEncoding` and text goes through
+  `_winansi_literal` (cp1252, octal escapes) — "APPROUVÉ", "GEPRÜFT" and a
+  "·" in line 2 depend on it. Rotated pages: display dims + `_ap_upright_matrix`,
+  as image stamps.
+- Client: a click stamps a default size centred on the click and commits at
+  once (like Signature); the tool STAYS armed for the next page. Label =
+  `window.t('stamp.<key>')` upper-cased (the UI language), Custom = typed
+  text. Line 2 = Name + `toLocaleDateString`, baked in at placement; a lifted
+  stamp restyled via the presets KEEPS its line 2 (an old approval is not
+  re-dated). Panel `#at-stamp-props` is shown through `_STYLE_ROWS`.
+- Guarded by `tests/test_review_stamp.py` and `tests/js/viewer_stamp.test.mjs`.
+
+## Line ends, Polygon and Pen (v3.5)
+
+- **One Line tool, a style per end** (`_LINE_ENDS`: none/open/closed/circle/
+  square/slash = the standard `/LE` names). Arrow and Dbl Arrow are no longer
+  tools; `arrow`/`darrow` survive only as legacy draft tools and Comments
+  kinds. Lifting reads `/LE` into `line_ends` and must NOT flip a start-only
+  arrow's endpoints (the old Arrow tool did, to fit its one head).
+  `_line_end_ops` (server) and `_drawLineEnd` (client) must agree.
+- **Cloud is a border STYLE** (`border_style: 'cloud'`) for a rectangle (the
+  server writes the old rectangle cloud, `/Polygon` + `/PWRect`) or a closed
+  polygon (`/Vertices` + `/IT /PolygonCloud` + `/BE /S /C`). An old cloud lifts
+  as `tool: 'rect'` with `border_style: 'cloud'`. Bumps face outward by the
+  shoelace sign (`_cloud_polygon_ops` / `_cloudPolyD`), whichever way round
+  the corners were clicked. A cloud is never filled.
+- **Polygon is built by clicks**, so its in-progress draft must not be
+  committed by the next click (`_annotMouseDown` routes polygon to
+  `_polyClick` BEFORE the generic `if (_draft) commitDraft()`). Double-click
+  (the `detail >= 2` click), Enter, or a click on the first corner finishes and
+  commits at once; a capture-phase keydown owns Enter/Backspace/Esc while
+  building. Close shape unticked = `/PolyLine`, which has ends and no fill.
+- **Closing a polygon:** while building, the first corner is drawn as a
+  `.poly-close-target` circle (r 9 and green once 3+ corners make it
+  closable, else r 5) with its OWN mousedown that calls `_polyFinish`. It
+  replaces the generic first-corner drag handle, which used to swallow the
+  closing click. `_polyClick` also closes within 14px of the first corner
+  (was 8px, too hard to hit). Keep the target on top of the preview path.
+- **Cloud preview:** the in-progress draft of a closed polygon in Cloud style
+  is drawn with `_cloudPolyD(pts, _cloudArcPx(...))` once it has 3+ corners,
+  so it looks like the saved cloud while it is built, not a plain outline.
+  Both are covered in `tests/js/viewer_shapes_v35.test.mjs` ("clicking the
+  first-corner marker closes the shape", "a cloud polygon previews as a cloud
+  while it is being built").
+- **Pen** = `/Ink`; each stroke commits on mouseup (RDP-simplified,
+  `_simplifyStroke`); the tool stays armed. Highlighter = `/CA 0.35` + Multiply
+  + `/PWKind /Highlighter` (Comments kind `highlighter`).
+- Vertex shapes and ink are written with an ABSOLUTE-coordinate appearance
+  (BBox == Rect, `_attach_abs_ap`) and their points converted as points
+  (`_xform_pdf_points`) — rotated/cropped pages need nothing else.
+- New style fields (`lineStart`, `lineEnd`, `closed`, `highlighter`) live in
+  `_toolStyle()`: the control handler REBUILDS `_draft.style` from it, so a
+  field missing there is lost on the next control change.
+- Guarded by `tests/test_shapes_v35.py` (incl. pixel checks of every line end
+  and the outward cloud) and `tests/js/viewer_shapes_v35.test.mjs`. Verified
+  in the real app via computer-use (see the panel-zoom note).
+
 ## Editing the page's own text from the viewer (the Pointer)
 
 - **The gate is two conditions: the Tools panel OPEN and the tool ARMED**
@@ -730,6 +870,44 @@ object. See `docs/EDITOR_VIEWER_MERGE_PLAN.md` for the whole programme.
   estimate (~27px) pushed the view onto the page BEFORE the clicked thumbnail.
   The pin re-applies on ANY render above the target and only lets go once none
   is still queued/in flight. Guarded by `tests/js/viewer_thumb_jump.test.mjs`.
+- **The zoom follows the canvas width** (`_refitForCanvasWidth`, v3.5): a
+  FITTED zoom (`_zoomMode === 'fit'`) re-fits both ways when a side
+  panel opens/closes or the window resizes; a user's zoom is shrunk only if
+  the page fitted before and would not now (`_squeezedFrom` restores it when
+  room returns); a page zoomed past the edge is left alone. Driven by a
+  ResizeObserver on `#canvas-area` AND the panel's own `transitionend`
+  (`_refitAfterPanelSlide`, 700ms fallback, one re-check 250ms later). While a
+  panel slides (`_panelSliding`) re-fits are SKIPPED: a fit taken mid-slide
+  measured a canvas still on its way, and on a heavy document (the manual) the
+  page ended "resized a bit, but not enough". ResizeObserver needs rendered
+  frames, so neither it nor a fixed delay can be trusted alone. Every
+  fit records its width (`_noteFitAreaWidth`) as the baseline, or the first
+  toggle after opening a document did nothing. Guarded by
+  `tests/js/viewer_panel_refit.test.mjs`.
+  - **Fit vs the user's zoom is an explicit flag, `_zoomMode`, saved per tab.**
+    It was inferred from `zoomLevel === _autoFitZoom`, and `_resetViewerState`
+    (tab switch, page-rail reload) clears `_autoFitZoom` while keeping the
+    zoom — a fitted page silently became "the user's zoom", and being a hair
+    over the fit, "past the edge on purpose": the panel overlapped it again.
+    Fits set 'fit'; zoomIn/zoomOut/zoomReset and Ctrl+wheel set 'custom'. A
+    new way of zooming must set it. "Past the edge on purpose" needs >3% over.
+  - **Placeholders of unrendered pages must follow the zoom too**
+    (`_resizePlaceholders`, called from `redrawAllRendered`): width = page
+    width_pts x render scale x zoom. They used to keep the canvas width the
+    column was BUILT at, so after a panel toggle they held the column wide
+    and the fitted page was centred in it, pushed under the panel — measured
+    in the real app as canvas 1272 / page 1214 / column 1510. Test fixtures
+    that render every page (and checks that look at page 1 only) cannot see
+    this: measure EVERY block, with pages left unrendered.
+  - **Verify layout fixes in the real desktop app**, not only the Browser
+    pane: run `python src/backend/entry.py`, drive the window with
+    computer-use (open from the recent list, click TOOLS), and read the
+    `[ZOOM_FIT] ... measured:` line — `scroll` must equal `canvas`.
+  - Every decision is logged as `[ZOOM_FIT] <rule>: canvas a->b px, zoom x->y`
+    (via `/api/ui_event` name `refit`) — read the log before guessing. (`[FIT]`
+    is the text editor's fitting log, a different thing.) 600ms later a
+    `[ZOOM_FIT] <rule> measured: canvas, scroll, block, canvas-el, dpr, model
+    page` line records what the layout actually did.
 - The viewer's thumbnail rail does not reorder pages (Layout does), so its
   items/images are `draggable="false"` — the native image ghost read as a
   broken reorder feature.

@@ -1356,12 +1356,21 @@ def _boot_prefs():
     """What the page should start with: None for anything never saved, so the
     page falls back to its own defaults (localStorage, then the OS language)."""
     theme = _read_ui_prefs().get('theme')
+    os_lang = None
     try:
         from i18n import i18n_py
         lang = i18n_py.saved_lang()
+        if lang is None:
+            # First run: the page picks the language.  Hand it the OS's own
+            # answer where we have one (macOS), and log what the OS said so a
+            # wrong first-run language can be read off the log.
+            os_lang = i18n_py.os_lang()
+            _log(f'[LANG] first run: os languages {i18n_py.os_preferred_languages()} '
+                 f'-> {os_lang or "(none; page uses navigator.language)"}')
     except Exception:
         lang = None
-    return {'theme': theme if theme in _THEMES else None, 'lang': lang}
+    return {'theme': theme if theme in _THEMES else None, 'lang': lang,
+            'os_lang': os_lang}
 
 
 @app.route('/api/ui_prefs', methods=['POST'])
@@ -2098,6 +2107,24 @@ def ui_event():
     name = str(data.get('name', ''))[:20]
     via  = str(data.get('via', ''))[:20]
     outcome = str(data.get('outcome', ''))[:20]
+    if name == 'refit' and via.isalnum():
+        # The viewer's zoom follow-the-width decision (viewer-panel.js _logFit).
+        try:
+            o, n, z0, z1 = [float(v) for v in (data.get('nums') or [])][:4]
+            logger.info('[ZOOM_FIT] %s: canvas %d->%d px, zoom %.3f->%.3f',
+                        via, int(o), int(n), z0, z1)
+        except (TypeError, ValueError):
+            pass
+        return jsonify({'ok': True})
+    if name == 'refitm' and via.isalnum():
+        # ...and what the page measured afterwards (layout vs the model).
+        try:
+            v = [int(float(x)) for x in (data.get('nums') or [])][:6]
+            logger.info('[ZOOM_FIT] %s measured: canvas %d, scroll %d, block %d, '
+                        'canvas-el %d, dpr %d%%, model page %d px', via, *v)
+        except (TypeError, ValueError):
+            pass
+        return jsonify({'ok': True})
     if name.isalnum() and via.isalnum() and (not outcome or outcome.isalnum()):
         logger.info('[SHORTCUT] %s via %s: %s', name, via, outcome or 'run')
     return jsonify({'ok': True})
@@ -2135,8 +2162,9 @@ _boot.mark('flask routes registered')
 def get_app_dir():
     """Return the directory containing the HTML files and assets (project root)."""
     if getattr(sys, 'frozen', False):
-        # cx_Freeze: executable directory (assets/, locales/, src/frontend/ sit here)
-        return os.path.dirname(sys.executable)
+        # cx_Freeze: next to the executable (Contents/Resources in a macOS .app)
+        from platform_io import platform_paths
+        return platform_paths.frozen_data_dir()
     # Development: this file is <root>/src/backend/entry.py — climb to <root>.
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

@@ -36,6 +36,10 @@
       var saved = localStorage.getItem(STORE_KEY);
       if (saved && SUPPORTED.indexOf(saved) !== -1) return saved;
     } catch (_) { /* private mode / disabled storage */ }
+    // First run: the OS's own language list where the server can read it
+    // (macOS — WKWebView's navigator.language is not reliably the user's).
+    var osLang = window.PW_PREFS && window.PW_PREFS.os_lang;
+    if (osLang && SUPPORTED.indexOf(osLang) !== -1) return osLang;
     var nav = (navigator.language || 'en').slice(0, 2).toLowerCase();
     return SUPPORTED.indexOf(nav) !== -1 ? nav : FALLBACK;
   }

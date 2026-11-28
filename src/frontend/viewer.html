@@ -342,13 +342,17 @@ window.addEventListener('load', function () { bootMark('window load event'); });
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>
               <span class="at-tool-lbl" data-i18n="at_tool_text.text">Text</span>
             </button>
+            <button class="at-tool" id="at-tool-callout" title="Callout — a text box with a leader line pointing at something. Press where it should point, drag to where the text goes." onclick="selectAnnotTool('callout')" data-i18n-attr="title:at_tool_callout.callout_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><rect x="11" y="3" width="10" height="8" rx="1"/><path d="M11 7H7L3 19"/><path d="M3 19l.6-4.2M3 19l3.6-2.4"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_callout.callout">Callout</span>
+            </button>
+            <button class="at-tool" id="at-tool-stamp" title="Stamp — APPROVED, REJECTED, REVIEWED and more, with your name and the date. Click to stamp, or drag to size it." onclick="selectAnnotTool('stamp')" data-i18n-attr="title:at_tool_stamp.stamp_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M9 3h6l-1 7h-4z"/><path d="M5 14a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v3H5z"/><path d="M4 21h16"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_stamp.stamp">Stamp</span>
+            </button>
             <button class="at-tool" id="at-tool-highlight" title="Highlight" onclick="selectAnnotTool('highlight')" data-i18n-attr="title:at_tool_highlight.highlight_tip">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M9 11l-4 4v3h3l4-4"/><path d="M12 8l4 4"/><path d="M14 6l4 4 2-2a2.8 2.8 0 0 0-4-4z"/></svg>
               <span class="at-tool-lbl" data-i18n="at_tool_highlight.highlight">Highlight</span>
-            </button>
-            <button class="at-tool" id="at-tool-cloud" title="Revision cloud" onclick="selectAnnotTool('cloud')" data-i18n-attr="title:at_tool_cloud.revision_cloud_tip">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M6.5 18.5a3.5 3.5 0 0 1-.4-6.98 4.5 4.5 0 0 1 8.7-1.6 3.5 3.5 0 0 1 .9 6.9 2.6 2.6 0 0 1-.5.05H7a2.9 2.9 0 0 1-.5-.02z"/></svg>
-              <span class="at-tool-lbl" data-i18n="at_tool_cloud.cloud">Cloud</span>
             </button>
             <button class="at-tool" id="at-tool-rect" title="Rectangle" onclick="selectAnnotTool('rect')" data-i18n-attr="title:at_tool_rect.rectangle_tip">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18"><rect x="3.5" y="5.5" width="17" height="13" rx="1.5"/></svg>
@@ -362,13 +366,13 @@ window.addEventListener('load', function () { bootMark('window load event'); });
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/></svg>
               <span class="at-tool-lbl" data-i18n="at_tool_line.line">Line</span>
             </button>
-            <button class="at-tool" id="at-tool-arrow" title="Arrow line" onclick="selectAnnotTool('arrow')" data-i18n-attr="title:at_tool_arrow.arrow_line_tip">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="10 5 19 5 19 14"/></svg>
-              <span class="at-tool-lbl" data-i18n="at_tool_arrow.arrow">Arrow</span>
+            <button class="at-tool" id="at-tool-polygon" title="Polygon — click each corner, double-click to finish. Untick Close shape for an open polyline; Style: Cloud for a revision cloud." onclick="selectAnnotTool('polygon')" data-i18n-attr="title:at_tool_polygon.polygon_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" width="18" height="18"><path d="M12 3l8.5 6.2-3.2 10.3H6.7L3.5 9.2z"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_polygon.polygon">Polygon</span>
             </button>
-            <button class="at-tool" id="at-tool-darrow" title="Double-ended arrow line" onclick="selectAnnotTool('darrow')" data-i18n-attr="title:at_tool_darrow.double_arrow_line_tip">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><line x1="5" y1="19" x2="19" y2="5"/><polyline points="10 5 19 5 19 14"/><polyline points="14 19 5 19 5 10"/></svg>
-              <span class="at-tool-lbl" data-i18n="at_tool_darrow.dbl_arrow">Dbl Arrow</span>
+            <button class="at-tool" id="at-tool-pen" title="Pen — draw freehand. Tick Highlighter for a wide see-through marker." onclick="selectAnnotTool('pen')" data-i18n-attr="title:at_tool_pen.pen_tip">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M17 3l4 4L8 20l-5 1 1-5z"/><path d="M14 6l4 4"/></svg>
+              <span class="at-tool-lbl" data-i18n="at_tool_pen.pen">Pen</span>
             </button>
           </div>
         </div>
@@ -662,7 +666,27 @@ window.addEventListener('load', function () { bootMark('window load event'); });
               <option value="solid" data-i18n="annot_tools.solid">Solid</option>
               <option value="dashed" data-i18n="annot_tools.dashed">Dashed</option>
               <option value="dotted" data-i18n="annot_tools.dotted">Dotted</option>
+              <option value="cloud" data-i18n="annot_tools.cloud">Cloud</option>
             </select>
+          </label>
+        </div>
+
+        <!-- Line / polyline ends (v3.5) -->
+        <div class="at-ctrl-row" id="at-ends-props" style="display:none">
+          <span class="at-ctrl-lbl" data-i18n="annot_tools.ends">Ends</span>
+          <select class="at-sel" id="at-line-start" style="flex:1;min-width:0" title="Start" data-i18n-attr="title:annot_tools.start"><option value="none" data-i18n="annot_tools.end_none">None</option><option value="open" data-i18n="annot_tools.end_open">Open arrow</option><option value="closed" data-i18n="annot_tools.end_closed">Closed arrow</option><option value="circle" data-i18n="annot_tools.end_circle">Circle</option><option value="square" data-i18n="annot_tools.end_square">Square</option><option value="slash" data-i18n="annot_tools.end_slash">Slash</option></select>
+          <select class="at-sel" id="at-line-end" style="flex:1;min-width:0" title="End" data-i18n-attr="title:annot_tools.end"><option value="none" data-i18n="annot_tools.end_none">None</option><option value="open" data-i18n="annot_tools.end_open">Open arrow</option><option value="closed" data-i18n="annot_tools.end_closed">Closed arrow</option><option value="circle" data-i18n="annot_tools.end_circle">Circle</option><option value="square" data-i18n="annot_tools.end_square">Square</option><option value="slash" data-i18n="annot_tools.end_slash">Slash</option></select>
+        </div>
+        <div class="at-ctrl-row" id="at-poly-props" style="display:none">
+          <label class="at-check" title="Join the last corner to the first (untick for an open polyline)" data-i18n-attr="title:annot_tools.close_shape_tip">
+            <input type="checkbox" id="at-poly-closed" checked>
+            <span data-i18n="annot_tools.close_shape">Close shape</span>
+          </label>
+        </div>
+        <div class="at-ctrl-row" id="at-pen-props" style="display:none">
+          <label class="at-check" title="A wide see-through marker" data-i18n-attr="title:annot_tools.highlighter_tip">
+            <input type="checkbox" id="at-pen-hl">
+            <span data-i18n="annot_tools.highlighter">Highlighter</span>
           </label>
         </div>
 
@@ -680,6 +704,36 @@ window.addEventListener('load', function () { bootMark('window load event'); });
         </div>
 
         <!-- Sticky-note properties (shown only while the Sticky tool is armed) -->
+        <!-- Review stamp (shown while the Stamp tool is armed or a stamp is being edited) -->
+        <div id="at-stamp-props" style="display:none">
+          <div class="at-stamp-grid" role="group" aria-label="Stamp" data-i18n-attr="aria-label:at_tool_stamp.stamp">
+            <button class="at-stamp-opt active" data-key="approved" onclick="selectStampPreset('approved')" style="color:#1e8c3a" data-i18n="stamp.approved">Approved</button>
+            <button class="at-stamp-opt" data-key="rejected" onclick="selectStampPreset('rejected')" style="color:#c72929" data-i18n="stamp.rejected">Rejected</button>
+            <button class="at-stamp-opt" data-key="reviewed" onclick="selectStampPreset('reviewed')" style="color:#1466bf" data-i18n="stamp.reviewed">Reviewed</button>
+            <button class="at-stamp-opt" data-key="revised" onclick="selectStampPreset('revised')" style="color:#f06b00" data-i18n="stamp.revised">Revised</button>
+            <button class="at-stamp-opt" data-key="for_construction" onclick="selectStampPreset('for_construction')" style="color:#1e8c3a" data-i18n="stamp.for_construction">For construction</button>
+            <button class="at-stamp-opt" data-key="for_information" onclick="selectStampPreset('for_information')" style="color:#1466bf" data-i18n="stamp.for_information">For information</button>
+            <button class="at-stamp-opt" data-key="draft" onclick="selectStampPreset('draft')" style="color:#546e7a" data-i18n="stamp.draft">Draft</button>
+            <button class="at-stamp-opt" data-key="confidential" onclick="selectStampPreset('confidential')" style="color:#c72929" data-i18n="stamp.confidential">Confidential</button>
+            <button class="at-stamp-opt" data-key="void" onclick="selectStampPreset('void')" style="color:#c72929" data-i18n="stamp.void">Void</button>
+            <button class="at-stamp-opt" data-key="custom" onclick="selectStampPreset('custom')" style="color:#1466bf" data-i18n="stamp.custom">Custom…</button>
+          </div>
+          <div class="at-ctrl-row" id="at-stamp-custom-row" style="display:none">
+            <span class="at-ctrl-lbl" data-i18n="at_stamp_props.text">Text</span>
+            <input class="at-inp" id="at-stamp-custom" type="text" maxlength="60" oninput="_stampRestyleDraft()"
+                   placeholder="Stamp text" data-i18n-attr="placeholder:at_stamp_props.text_ph">
+          </div>
+          <div class="at-ctrl-row">
+            <span class="at-ctrl-lbl" data-i18n="at_stamp_props.colour">Colour</span>
+            <input class="at-color" id="at-stamp-color" type="color" value="#1e8c3a" oninput="_stampRestyleDraft()">
+            <label class="at-check" title="Add your Name and today's date under the stamp" data-i18n-attr="title:at_stamp_props.name_date_tip">
+              <input type="checkbox" id="at-stamp-sub" checked>
+              <span data-i18n="at_stamp_props.name_date">Name &amp; date</span>
+            </label>
+          </div>
+          <div class="at-hint" data-i18n="at_stamp_props.hint">Click the page to stamp, or drag to size it. Click a stamp later to move, resize or change it.</div>
+        </div>
+
         <div id="at-sticky-props" style="display:none">
           <div class="at-ctrl-row">
             <span class="at-ctrl-lbl" data-i18n="at_sticky_props.colour">Colour</span>
@@ -938,6 +992,34 @@ window.addEventListener('load', function () { bootMark('window load event'); });
 </div>
 
 <!-- Viewer tool context menu -->
+<!-- Text markup pop-up (v3.5): over a text selection it marks the words up;
+     over a selected highlight/underline it recolours, changes kind, deletes.
+     Driven by viewer-panel.js (_tmShow*). -->
+<div id="tm-popup" role="toolbar" aria-label="Mark up text" data-i18n-attr="aria-label:tm.toolbar">
+  <div class="tm-row">
+    <button class="tm-btn" data-kind="Highlight" onmousedown="event.preventDefault()" onclick="_tmKind('Highlight')"
+            title="Highlight" aria-label="Highlight" data-i18n-attr="title:tm.highlight;aria-label:tm.highlight"><span class="tm-g tm-g-hl">ab</span></button>
+    <button class="tm-btn" data-kind="Underline" onmousedown="event.preventDefault()" onclick="_tmKind('Underline')"
+            title="Underline" aria-label="Underline" data-i18n-attr="title:tm.underline;aria-label:tm.underline"><span class="tm-g tm-g-ul">ab</span></button>
+    <button class="tm-btn" data-kind="StrikeOut" onmousedown="event.preventDefault()" onclick="_tmKind('StrikeOut')"
+            title="Strikethrough" aria-label="Strikethrough" data-i18n-attr="title:tm.strikeout;aria-label:tm.strikeout"><span class="tm-g tm-g-so">ab</span></button>
+    <button class="tm-btn" data-kind="Squiggly" onmousedown="event.preventDefault()" onclick="_tmKind('Squiggly')"
+            title="Squiggly underline" aria-label="Squiggly underline" data-i18n-attr="title:tm.squiggly;aria-label:tm.squiggly"><span class="tm-g tm-g-sq">ab</span></button>
+  </div>
+  <div class="tm-row" id="tm-edit-row">
+    <button class="tm-sw" style="background:#ffeb00" onmousedown="event.preventDefault()" onclick="_tmColor([1,0.92,0])" title="Yellow" aria-label="Yellow" data-i18n-attr="title:tm.yellow;aria-label:tm.yellow"></button>
+    <button class="tm-sw" style="background:#4dd959" onmousedown="event.preventDefault()" onclick="_tmColor([0.3,0.85,0.35])" title="Green" aria-label="Green" data-i18n-attr="title:tm.green;aria-label:tm.green"></button>
+    <button class="tm-sw" style="background:#4099ff" onmousedown="event.preventDefault()" onclick="_tmColor([0.25,0.6,1])" title="Blue" aria-label="Blue" data-i18n-attr="title:tm.blue;aria-label:tm.blue"></button>
+    <button class="tm-sw" style="background:#ff73bf" onmousedown="event.preventDefault()" onclick="_tmColor([1,0.45,0.75])" title="Pink" aria-label="Pink" data-i18n-attr="title:tm.pink;aria-label:tm.pink"></button>
+    <button class="tm-sw" style="background:#db1a1a" onmousedown="event.preventDefault()" onclick="_tmColor([0.86,0.1,0.1])" title="Red" aria-label="Red" data-i18n-attr="title:tm.red;aria-label:tm.red"></button>
+    <span class="tm-sep"></span>
+    <button class="tm-btn tm-del" onmousedown="event.preventDefault()" onclick="_tmDelete()"
+            title="Delete" aria-label="Delete" data-i18n-attr="title:tm.delete;aria-label:tm.delete">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+    </button>
+  </div>
+</div>
+
 <div id="viewer-ctx-menu">
   <div class="vctx-item" id="vctx-pointer" onclick="setViewerTool('pointer')" data-i18n="vctx_pointer.pointer_tool">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 4 7.07 17 2.51-7.39L21 11.07z"/></svg>
@@ -1737,9 +1819,20 @@ window.addEventListener('load', function () { bootMark('window load event'); });
 <div id="whats-new-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:10003;align-items:center;justify-content:center">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px 24px 18px;max-width:520px;width:92%;box-shadow:0 24px 64px rgba(0,0,0,.5);max-height:82vh;overflow-y:auto">
     <div style="font-size:16px;font-weight:600;margin-bottom:4px;color:var(--text)" data-i18n="whats_new.title">What's new in this version</div>
-    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px" data-i18n="whats_new.subtitle">Version 3.4 makes printing, editing text and moving between pages smoother.</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-bottom:14px" data-i18n="whats_new.subtitle">Version 3.5 adds pen, polygon, review stamps, callouts and text markup, fixes printing with more than one document open, and keeps the page in view when you open a side panel.</div>
 
     <div style="font-size:13px;color:var(--text);line-height:1.65">
+      <ul style="margin:0 0 14px 18px;padding:0">
+        <li data-i18n="whats_new.v35_item_text_markup">Select text and a small toolbar offers Highlight, Underline, Strikethrough and Squiggly underline — line by line, like a real highlighter. Click a mark later to change its colour or kind, or press Delete to remove it.</li>
+        <li data-i18n="whats_new.v35_item_callout">New Callout tool: a text box with an arrow pointing at something. Press where it should point and drag to where the text goes. Click it later to move the box, drag the arrow tip, or edit the text.</li>
+        <li data-i18n="whats_new.v35_item_stamp">New Stamp tool: APPROVED, REJECTED, REVIEWED, FOR CONSTRUCTION and more, or your own text — with your name and the date. Click the page to stamp, or drag to size it.</li>
+        <li data-i18n="whats_new.v35_item_shapes">New Pen (with a see-through Highlighter) and Polygon tools. Line now has a choice of end for each end — open or closed arrow, circle, square or slash — replacing Arrow and Dbl Arrow, and Cloud is a Style you can give a rectangle or any polygon.</li>
+        <li data-i18n="whats_new.v35_item_print_tab">Ctrl+P now prints the document you are looking at. After opening a second PDF from File Explorer, it used to swap that tab back to the first document.</li>
+        <li data-i18n="whats_new.v35_item_panel_fit">Opening or closing the Tools panel (or the page list) now resizes the page to fit, so you no longer have to scroll sideways to reach its right-hand side. A zoom you set yourself is kept whenever the page still fits.</li>
+        <li data-i18n="whats_new.v35_item_macos">Mac: the app now opens after you download it. It used to be reported as “damaged” and could not be opened. The first time, macOS may say it cannot verify the developer: choose Open Anyway in System Settings › Privacy & Security. The licence text now loads, and the first start follows your Mac’s language.</li>
+      </ul>
+      <!-- The 3.4 note stays, for anyone skipping straight from 3.3. -->
+      <div style="font-size:12px;font-weight:600;color:var(--text-dim);margin:0 0 6px" data-i18n="whats_new.v34_heading">From version 3.4: smoother printing, text editing and page navigation.</div>
       <ul style="margin:0 0 14px 18px;padding:0">
         <li data-i18n="whats_new.v34_item_print">Print: click in the page-range box and Custom is selected for you, ready to type the pages you want.</li>
         <li data-i18n="whats_new.v34_item_ctrlp">Ctrl+P now reliably opens Print — including straight after the Open or Save dialog, or after printing.</li>

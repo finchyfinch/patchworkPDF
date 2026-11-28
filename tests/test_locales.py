@@ -32,7 +32,8 @@ _SAME_ON_PURPOSE = {
     'de': {'about_version.version', 'annot_tools.text', 'at_sig_props.name',
            'at_tool_ellipse.ellipse', 'at_tool_text.text', 'comments.type_ellipse',
            'comments.type_text', 'confirm.ok', 'ed_tools.text', 'ed_wm_props.text',
-           'ff_type.dropdown', 'rp_group.your_name',
+           'ff_type.dropdown', 'rp_group.your_name', 'at_stamp_props.text',
+           'at_tool_polygon.polygon', 'comments.type_polygon',
            # "Layout" is the name of the screen, used as-is in German UIs
            'sticky_top.layout', 'viewer.header.layout', 'viewer_empty_state.layout'},
     'fr': {'about_version.version', 'annot_tools.style', 'at_sig_props.style',

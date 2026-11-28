@@ -84,6 +84,7 @@ function _saveActiveTabMeta() {
   _tabs[_activeTabIdx].page_id   = currentPageId;
   _tabs[_activeTabIdx].label     = allPages.length ? allPages[0].filename : 'Document';
   _tabs[_activeTabIdx].zoomLevel = zoomLevel;
+  _tabs[_activeTabIdx].zoomMode  = _zoomMode;
   const anchor = _captureScrollAnchor();
   if (anchor) _tabs[_activeTabIdx].scroll = anchor;
   const thumbTop = _captureThumbScroll();
@@ -164,6 +165,7 @@ function _vFetch(url, options) {
 }
 
 function _resetViewerState() {
+  if (typeof _tmHide === 'function') _tmHide();
   // Cancel any in-flight requests from the previous tab
   _viewerAbortCtrl.abort();
   _viewerAbortCtrl = new AbortController();
@@ -244,6 +246,7 @@ async function _switchTab(idx) {
   currentPageId = tab.page_id || '';
   zoomLevel     = tab.zoomLevel || 1.0;
   _fitWidthPending = !tab.zoomLevel;   // no stored zoom yet → open fitted
+  _zoomMode = tab.zoomMode || (tab.zoomLevel ? 'custom' : 'fit');
   _restoreTabDirty(tab);
   const zl = document.getElementById('zoom-label');
   if (zl) zl.textContent = Math.round(zoomLevel * 100) + '%';
@@ -290,6 +293,7 @@ async function _closeTab(idx, skipCleanup) {
     currentPageId = tab.page_id || '';
     zoomLevel     = tab.zoomLevel || 1.0;
     _fitWidthPending = !tab.zoomLevel;   // no stored zoom yet → open fitted
+    _zoomMode = tab.zoomMode || (tab.zoomLevel ? 'custom' : 'fit');
     _restoreTabDirty(tab);
     const zl = document.getElementById('zoom-label');
     if (zl) zl.textContent = Math.round(zoomLevel * 100) + '%';
@@ -360,6 +364,7 @@ function openNewTab(session_id, page_id) {
   currentPageId = page_id;
   zoomLevel     = 1.0;
   _fitWidthPending = true;   // new documents open fitted to width
+  _zoomMode     = 'fit';
   if (typeof pwSetDocDirty === 'function') pwSetDocDirty(false);   // nothing edited yet
   const zl = document.getElementById('zoom-label');
   if (zl) zl.textContent = '100%';
@@ -635,6 +640,11 @@ let _lastSelectedText  = '';       // most recent text selection (title pre-fill
 
 // Editable-annotation state: page_id → [info] for selection/lift-to-edit/delete
 let _editableAnnots    = {};
+// Text markup (see "Text markup" below).
+let _tmSel     = null;   // {mode:'selection', page_id, quads, text}
+                         // | {mode:'markup', page_id, info}
+let _tmPending = null;   // a press on a markup hit-area, resolved on mouseup
+const _tmLastColor = {}; // kind -> colour last picked for it (this session)
 let _pendingLift       = null;     // {info, page_id} awaiting page re-render to build draft
 
 // Area-select + annotation clipboard (marquee → Ctrl+C → Ctrl+V, cross-page)
@@ -664,6 +674,34 @@ function toggleLeftPanel() {
     : '<polyline points="15 18 9 12 15 6"/>';  // < (collapse)
   if (btn) btn.title = leftCollapsed ? 'Expand panel' : 'Collapse panel';
   title.style.display = leftCollapsed ? 'none' : '';
+  _refitAfterPanelSlide(panel);
+}
+
+// A side panel changes the canvas width over its .2s slide.  Re-fit when the
+// slide has FINISHED: a fit taken mid-slide measures a canvas still on its way
+// (the v3.5 "resized a bit, but not enough" report — on a heavy document the
+// slide ran past a fixed 220ms guess, and the ResizeObserver, which fires on
+// rendered frames only, did not always follow up).  While a panel slides,
+// observer-driven re-fits are skipped; transitionend ends the slide, with a
+// timeout for when it never comes (no frames), and one re-check after that.
+let _panelSliding = 0;
+function _refitAfterPanelSlide(panelEl) {
+  if (typeof _refitForCanvasWidth !== 'function') return;
+  _panelSliding++;
+  let done = false;
+  const onEnd = (e) => {
+    if (e && e.target === panelEl && (!e.propertyName || e.propertyName === 'width')) finish();
+  };
+  function finish() {
+    if (done) return;
+    done = true;
+    _panelSliding = Math.max(0, _panelSliding - 1);
+    if (panelEl && panelEl.removeEventListener) panelEl.removeEventListener('transitionend', onEnd);
+    _refitForCanvasWidth();
+    setTimeout(_refitForCanvasWidth, 250);   // cheap no-op unless the width moved again
+  }
+  if (panelEl && panelEl.addEventListener) panelEl.addEventListener('transitionend', onEnd);
+  setTimeout(finish, 700);
 }
 
 // ── Left panel horizontal resize ────────────────────────────────────────────
@@ -709,7 +747,9 @@ function startLeftResize(ev) {
 let rightCollapsed = true;
 function toggleRightPanel() {
   rightCollapsed = !rightCollapsed;
-  document.getElementById('right-panel').classList.toggle('collapsed', rightCollapsed);
+  const rp = document.getElementById('right-panel');
+  rp.classList.toggle('collapsed', rightCollapsed);
+  _refitAfterPanelSlide(rp);
   // Text editing is gated on the panel being OPEN, not just on the tool being
   // armed — closing the panel is how the user puts the toolset away, and a
   // page click afterwards must go back to selecting text, not rewriting it.
@@ -731,9 +771,10 @@ function toggleRightPanel() {
 // a tool's settings are never armed out of sight.
 const _RIGHT_MODES = ['comment', 'edit', 'sign'];
 const _TOOL_TAB = {
-  sticky: 'comment', text: 'comment', highlight: 'comment', cloud: 'comment',
-  rect: 'comment', ellipse: 'comment', line: 'comment', arrow: 'comment',
-  darrow: 'comment',
+  sticky: 'comment', text: 'comment', callout: 'comment', stamp: 'comment',
+  highlight: 'comment',
+  rect: 'comment', ellipse: 'comment', line: 'comment', polygon: 'comment',
+  pen: 'comment',
   edittext: 'edit', pagetext: 'edit', image: 'edit', redact: 'edit',
   watermark: 'edit', crop: 'edit',
   formfield: 'sign', signature: 'sign',
@@ -1225,7 +1266,7 @@ async function _renderPageBlockNow(idx) {
         _fitWidthPending = false;
         _fitWidestPts    = Math.max(st.pageW || 0, _docWidestWidthPts());
         _applyFitZoom(_fitZoomFor(_fitNaturalW(st)));
-      } else if (st.pageW > _fitWidestPts + 1 && zoomLevel === _autoFitZoom) {
+      } else if (st.pageW > _fitWidestPts + 1 && _zoomMode === 'fit') {
         // This page turned out wider than anything the opening fit knew about
         // — the page list under-reported it (dimensions recorded before a
         // /Rotate was taken into account, or a session recovered without
@@ -1440,6 +1481,7 @@ function redrawAllRendered(opts) {
     if (defer && !onScreen.has(page_id)) _resizePageBlockCss(page_id);
     else redrawPageBlock(page_id);
   });
+  _resizePlaceholders();   // unrendered pages follow the zoom too
 }
 
 // Redraw pages that a live zoom gesture left CSS-resized.
@@ -1617,13 +1659,13 @@ const ZOOM_MAX  = ZOOM_STEPS[ZOOM_STEPS.length - 1];
 
 function zoomIn() {
   const next = ZOOM_STEPS.find(z => z > zoomLevel + _ZOOM_EPS);
-  if (next) { zoomLevel = next; applyZoom(); }
+  if (next) { zoomLevel = next; _zoomMode = 'custom'; applyZoom(); }
 }
 function zoomOut() {
   const prev = [...ZOOM_STEPS].reverse().find(z => z < zoomLevel - _ZOOM_EPS);
-  if (prev) { zoomLevel = prev; applyZoom(); }
+  if (prev) { zoomLevel = prev; _zoomMode = 'custom'; applyZoom(); }
 }
-function zoomReset() { zoomLevel = 1.0; applyZoom(); }
+function zoomReset() { zoomLevel = 1.0; _zoomMode = 'custom'; applyZoom(); }
 
 // ── Fit-width zoom ───────────────────────────────────────────────────────────
 // Default view: pages open fitted to the canvas width.  The flag is consumed
@@ -1636,11 +1678,20 @@ let _fitWidthPending = false;
 // user has set a zoom of their own.
 let _fitWidestPts = 0;
 let _autoFitZoom  = null;
+// Is the zoom a FIT (follows the canvas width) or the user's own?  Explicit,
+// per tab (saved in _saveActiveTabMeta).  It used to be inferred from
+// `zoomLevel === _autoFitZoom`, and anything that reset _autoFitZoom without
+// changing the zoom (_resetViewerState: a tab switch, a page-rail reload)
+// silently turned a fitted page into "the user's zoom" — which a side panel
+// then left overflowing (the v3.5 "panel overlaps again" report).
+let _zoomMode = 'fit';
 
 function _applyFitZoom(z) {
   zoomLevel        = z;
   _autoFitZoom     = z;
+  _zoomMode        = 'fit';
   _lastAppliedZoom = z;
+  _noteFitAreaWidth();   // the width this fit was made for: the baseline to re-fit from
   const zl = document.getElementById('zoom-label');
   if (zl) zl.textContent = Math.round(zoomLevel * 100) + '%';
   redrawAllRendered();   // resize any page built before the fit applied
@@ -1651,15 +1702,18 @@ function _applyFitZoom(z) {
 // applies in both the windowed and fullscreen views.
 let _pageLayout = 'single';
 
-function _fitZoomFor(naturalW) {
+// *areaW* fits to a canvas width other than the current one (what the fit WAS
+// before a resize); defaults to the canvas as it is now.
+function _fitZoomFor(naturalW, areaW) {
   const area = document.getElementById('canvas-area');
   if (!area || !naturalW) return 1.0;
+  if (!areaW) areaW = area.clientWidth;
   // In two-up, the usable width is split between two columns (less the grid gap),
   // so pages fit to roughly half the viewport.
   const cols = (_pageLayout === 'two-up') ? 2 : 1;
   const gap  = (cols - 1) * 20;   // matches the grid gap in viewer.css
   // 24px column padding each side + a little room for the scrollbar
-  const avail = Math.max(200, (area.clientWidth - 58 - gap) / cols);
+  const avail = Math.max(200, (areaW - 58 - gap) / cols);
   return Math.max(0.25, Math.min(4.0, avail / naturalW));
 }
 
@@ -1695,8 +1749,130 @@ function zoomFitWidth() {
   _fitWidestPts = Math.max(st.pageW || 0, _docWidestWidthPts());
   zoomLevel     = _fitZoomFor(_fitNaturalW(st));
   _autoFitZoom  = zoomLevel;   // a later, wider page may still correct this
+  _zoomMode     = 'fit';
+  _noteFitAreaWidth();
   applyZoom();
 }
+
+// ── Follow the canvas width (side panels, window size) ───────────────────────
+// Opening the Tools panel (or the left panel, or shrinking the window) narrows
+// the canvas; a page that was fitted then runs off the right edge and has to be
+// scrolled to reach.  The usual viewer rule (Acrobat, Edge, Chrome):
+//   * a FITTED zoom follows the width, both ways — narrower and wider;
+//   * a zoom the user chose stays theirs — EXCEPT that a page which fitted
+//     before the canvas narrowed is shrunk just enough to keep fitting, and the
+//     user's zoom comes back (as far as it fits) when the room does.  A page the
+//     user had zoomed past the edge on purpose is left alone.
+// Driven by a ResizeObserver on #canvas-area, settled so a panel's .2s width
+// transition costs one re-fit, not one per frame.
+let _fitAreaW      = 0;     // canvas width the current zoom was judged against
+let _squeezedFrom  = null;  // the user's zoom, while a narrowing has shrunk it
+let _squeezedTo    = null;  // the zoom that narrowing set (a change = user zoomed)
+let _canvasResizeTimer = null;
+
+// A fit records the width it was made for.  The observer's own first sighting
+// can come before any document (or while the canvas is hidden), and without a
+// baseline the first panel toggle after opening was only recorded, not acted on.
+function _noteFitAreaWidth() {
+  const area = document.getElementById('canvas-area');
+  if (area && area.clientWidth) _fitAreaW = area.clientWidth;
+}
+const _CANVAS_SETTLE_MS = 120;
+
+function _refitForCanvasWidth() {
+  const area  = document.getElementById('canvas-area');
+  const panel = document.getElementById('panel-viewer');
+  if (!area || (panel && panel.style.display === 'none')) return;
+  if (_panelSliding) return;                       // judged when the slide ends
+  const w = area.clientWidth;
+  if (!w) return;                                  // hidden: judge it when shown
+  const oldW = _fitAreaW;
+  if (Math.abs(w - oldW) < 2) return;
+  _fitAreaW = w;
+  if (!oldW) return;                               // first measurement: nothing to compare
+
+  const st = _pageBlocks.get(currentPageId)
+          || [..._pageBlocks.values()].find(s => s.image);
+  if (!st || !st.image) return;                    // nothing rendered: the open will fit
+  const natW   = _fitNaturalW(st);
+  const fitNow = _fitZoomFor(natW, w);
+  const EPS    = 0.001;
+
+  // The user zoomed since a squeeze: their new zoom is the one to keep.
+  if (_squeezedFrom !== null && Math.abs(zoomLevel - _squeezedTo) > EPS) {
+    _squeezedFrom = _squeezedTo = null;
+  }
+  const z0 = zoomLevel;
+  // Fitted: follow the width.
+  if (_zoomMode === 'fit') {
+    if (Math.abs(fitNow - zoomLevel) < EPS) { _logFit('fit', oldW, w, z0, z0); return; }
+    _fitWidestPts = Math.max(st.pageW || 0, _docWidestWidthPts());
+    zoomLevel = _autoFitZoom = fitNow;
+    applyZoom();
+    _logFit('fit', oldW, w, z0, zoomLevel);
+    return;
+  }
+  // The user's own zoom.
+  let target;
+  if (_squeezedFrom !== null) {
+    target = Math.min(_squeezedFrom, fitNow);      // give it back as room allows
+    if (target >= _squeezedFrom - EPS) _squeezedFrom = null;
+  } else {
+    const fitBefore = _fitZoomFor(natW, oldW);
+    // Past the edge ON PURPOSE means clearly past it — not a scrollbar's width
+    // or a rounding hair, which a fitted page can be after a re-layout.
+    if (zoomLevel > fitBefore * 1.03 + EPS) { _logFit('wide', oldW, w, z0, z0); return; }
+    if (zoomLevel <= fitNow + EPS) { _logFit('fits', oldW, w, z0, z0); return; }
+    _squeezedFrom = zoomLevel;
+    target = fitNow;
+  }
+  if (Math.abs(target - zoomLevel) < EPS) { _logFit('custom', oldW, w, z0, z0); return; }
+  zoomLevel   = target;
+  _squeezedTo = _squeezedFrom !== null ? target : null;
+  applyZoom();
+  _logFit('custom', oldW, w, z0, zoomLevel);
+}
+
+// One [ZOOM_FIT] line in the app log per canvas-width change: which rule ran and
+// what it did.  Diagnostic only (a panel toggle or window resize, not a
+// stream); a failed post is ignored.
+function _logFit(rule, oldW, newW, z0, z1) {
+  try {
+    apiFetch('/api/ui_event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'refit', via: rule,
+                             nums: [Math.round(oldW), Math.round(newW),
+                                    +z0.toFixed(4), +z1.toFixed(4)] }) }).catch(() => {});
+    // ...and what the page ACTUALLY measures once the redraw has settled: the
+    // model above can be right while the layout disagrees with it.
+    setTimeout(() => {
+      const area = document.getElementById('canvas-area');
+      const st = _pageBlocks.get(currentPageId);
+      const blk = st && st.block;
+      if (!area || !blk) return;
+      apiFetch('/api/ui_event', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'refitm', via: rule,
+          nums: [area.clientWidth, area.scrollWidth, blk.offsetWidth,
+                 st.canvas ? st.canvas.offsetWidth : 0,
+                 Math.round((window.devicePixelRatio || 1) * 100),
+                 Math.round((st.pageW || 0) * (st.renderScale || 0) * zoomLevel)] }) }).catch(() => {});
+    }, 600);
+  } catch (_) {}
+}
+
+function _onCanvasAreaResize() {
+  clearTimeout(_canvasResizeTimer);
+  _canvasResizeTimer = setTimeout(_refitForCanvasWidth, _CANVAS_SETTLE_MS);
+}
+
+(function _watchCanvasWidth() {
+  const hook = () => {
+    const area = document.getElementById('canvas-area');
+    if (!area || typeof ResizeObserver === 'undefined') return;
+    new ResizeObserver(_onCanvasAreaResize).observe(area);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hook);
+  else hook();
+})();
 
 // ── Two-up (side-by-side) reading layout ─────────────────────────────────────
 // Toggle the same page column between a single continuous scroll and a 2-wide
@@ -1720,22 +1896,41 @@ function toggleTwoUp() {
   zoomFitWidth();
 }
 
-// Re-size the placeholder blocks of not-yet-rendered pages to the current
-// layout's per-column width, preserving each page's aspect ratio. Rendered
-// pages size to their own canvas and are left untouched.
+// Re-size the placeholder blocks of not-yet-rendered pages to the width they
+// WILL render at — the page's width in points x the render scale x the zoom —
+// preserving each one's aspect ratio.  Rendered pages size to their own canvas
+// and are left untouched.
+//
+// They used to take the canvas width once, when the column was built, and
+// were resized only by the two-up toggle.  Opening the Tools panel then
+// re-fitted the rendered pages while every unrendered placeholder stayed at
+// the OLD, wider canvas width: the column grew to fit them, the fitted page
+// was centred in that over-wide column — pushed right, under the panel — and
+// a horizontal scrollbar appeared (v3.5, measured in the app: canvas 1272,
+// page 1214, column 1510).  Called from redrawAllRendered, so every zoom —
+// fits, panel toggles, the user's own — keeps them in step.
 function _resizePlaceholders() {
   const area = document.getElementById('canvas-area');
   if (!area) return;
   const cols = (_pageLayout === 'two-up') ? 2 : 1;
   const colW = Math.max(300, (area.clientWidth - 48 - (cols - 1) * 20) / cols);
-  _pageBlocks.forEach(st => {
+  // Pixels per point at this zoom, from any page that has rendered (they share
+  // the base render scale); none yet → the column width, as before.
+  let ppt = 0;
+  for (const st of _pageBlocks.values()) {
+    if (st.rendered && st.renderScale) { ppt = st.renderScale * zoomLevel; break; }
+  }
+  const wPts = new Map(allPages.map(p => [p.id, +p.width_pts || 0]));
+  _pageBlocks.forEach((st, pid) => {
     if (st.rendered || !st.placeholder) return;
     const ph     = st.placeholder;
     const oldW   = parseFloat(ph.style.width)  || colW;
     const oldH   = parseFloat(ph.style.height) || oldW;
     const aspect = oldW > 0 ? oldH / oldW : 11 / 8.5;
-    ph.style.width  = colW + 'px';
-    ph.style.height = Math.round(colW * aspect) + 'px';
+    const pw     = wPts.get(pid);
+    const w      = (ppt && pw) ? Math.max(40, pw * ppt) : colW;
+    ph.style.width  = Math.round(w) + 'px';
+    ph.style.height = Math.round(w * aspect) + 'px';
   });
 }
 
@@ -1767,6 +1962,7 @@ window.addEventListener('wheel', e => {
     _pinchTarget = null;
     if (target === null || Math.abs(target - zoomLevel) < 0.001) return;
     zoomLevel = target;
+    _zoomMode = 'custom';
     applyZoom({ focalX: focal.x, focalY: focal.y, live: true });
   });
 }, { passive: false });
@@ -1823,6 +2019,7 @@ let _zoomAnim = null;   // in-flight settle animation, superseded by the next zo
 //       defers off-screen redraws.
 function applyZoom(opts) {
   opts = opts || {};
+  if (_tmSel) _tmHide();   // fixed-position pop-up: the words are moving
   // A zoom retires a held scroll anchor: its offset into the page is in
   // old-zoom pixels, so re-applying it after the redraw would jump the view.
   if (_pendingPin && _pendingPin.hold) _pendingPin = null;
@@ -3466,6 +3663,10 @@ const _COMMENT_TYPE_KEYS = {
   Squiggly: 'comments.type_squiggly', Caret: 'comments.type_caret',
 };
 function _commentTypeLabel(ann) {
+  if (ann.kind === 'callout') return window.t('comments.type_callout');
+  if (ann.kind === 'stamp') return window.t('comments.type_stamp');
+  if (ann.kind === 'polygon') return window.t('comments.type_polygon');
+  if (ann.kind === 'highlighter') return window.t('comments.type_highlighter');
   if (ann.subtype === 'Line') {
     return window.t(ann.kind === 'darrow' ? 'comments.type_darrow'
                   : ann.kind === 'arrow'  ? 'comments.type_arrow'
@@ -3483,6 +3684,9 @@ let _replyingTo = null;     // {page_id, annot_idx} while a reply box is open
 let _replyDraft = '';       // its text, so a re-render does not lose it
 
 function _commentTypeId(ann) {
+  if (ann.kind === 'callout') return 'callout';
+  if (ann.kind === 'stamp') return 'stamp';
+  if (ann.kind === 'polygon' || ann.kind === 'highlighter') return ann.kind;
   return ann.subtype === 'Line' ? (ann.kind || 'line') : ann.subtype;
 }
 function _commentState(ann) {
@@ -3768,12 +3972,50 @@ function drawEditableHitAreas(page_id) {
   const scale = st.renderScale * zoomLevel, pageH = st.pageH;
 
   list.forEach(info => {
+    // Text markup: one hit-area per line.  A press only NOTES the markup; the
+    // marquee still starts underneath, and _onViewerMouseUp selects the markup
+    // only if the press did not turn into a drag — so text that is already
+    // highlighted can still be selected (and copied, or marked up again).
+    if (info.tool === 'textmarkup') {
+      (info.quads || []).forEach(q => {
+        // Padded: a line of text at a low zoom is only a few pixels tall,
+        // and an underline sits at its very bottom — an exact-fit target is
+        // missed by a click a couple of pixels off.  At least 14px, centred.
+        const lh  = (q[3] - q[1]) * scale;
+        const hh  = Math.max(14, lh + 6);
+        const hit = document.createElementNS(NS_SVG, 'rect');
+        hit.setAttribute('class', 'tm-hit');
+        hit.setAttribute('x', q[0] * scale - 2);
+        hit.setAttribute('y', (pageH - q[3]) * scale - (hh - lh) / 2);
+        hit.setAttribute('width', (q[2] - q[0]) * scale + 4);
+        hit.setAttribute('height', hh);
+        hit.setAttribute('fill', 'transparent');
+        hit.style.pointerEvents = active ? 'all' : 'none';
+        hit.style.cursor = 'pointer';
+        hit.addEventListener('mousedown', () => {
+          if (_editSelectActive()) _tmPending = { info, page_id };
+        });
+        ov.appendChild(hit);
+      });
+      return;
+    }
     // Comments (sticky notes + comment-list FreeText) keep their text/author
     // popup — only non-comment markup uses lift-to-draft editing.
     if (info.tool === 'sticky') return;
     if (info.tool === 'text' && info.is_comment) return;
     let el;
-    if (_isLineTool(info.tool)) {
+    if ((info.tool === 'polygon' && info.vertices) || (info.tool === 'pen' && info.strokes)) {
+      const lists = info.tool === 'pen' ? info.strokes : [info.vertices];
+      el = document.createElementNS(NS_SVG, 'path');
+      el.setAttribute('d', lists.map(fl => {
+        const pts = [];
+        for (let i = 0; i + 1 < fl.length; i += 2) pts.push((fl[i] * scale) + ',' + ((pageH - fl[i + 1]) * scale));
+        return 'M' + pts.join(' L') + (info.tool === 'polygon' && info.closed ? ' Z' : '');
+      }).join(' '));
+      el.setAttribute('stroke', 'transparent');
+      el.setAttribute('stroke-width', Math.max(10, (info.border_width || 1) * scale + 6));
+      el.setAttribute('fill', info.tool === 'polygon' && info.closed ? 'transparent' : 'none');
+    } else if (_isLineTool(info.tool)) {
       if (!info.line) return;
       const [x1, y1, x2, y2] = info.line;
       el = document.createElementNS(NS_SVG, 'line');
@@ -3801,6 +4043,8 @@ function drawEditableHitAreas(page_id) {
     });
     ov.appendChild(el);
   });
+  // A re-render rebuilt this overlay: put the selected markup's ring back.
+  if (_tmSel && _tmSel.mode === 'markup' && _tmSel.page_id === page_id) _tmDrawRing();
 }
 
 function selectAnnotation(info, page_id) {
@@ -3870,10 +4114,14 @@ function _buildLiftedDraft(info, page_id) {
     lineColor: info.border_color || (info.tool === 'highlight' ? [1, 0.92, 0] : [1, 0, 0]),
     lineWidth: (info.border_width != null ? info.border_width : 1),
     lineStyle: info.border_style || 'solid',
-    textBox:   (info.tool === 'text' ? (info.border_width || 0) > 0 : true),
+    textBox:   (info.tool === 'text' ? (info.border_width || 0) > 0 : true),   // callout: always
     fillOn:    !!info.fill_color,                 // restore rect/ellipse interior fill
     fillColor: info.fill_color || [1, 1, 0],
     font:      info.font || 'Helvetica',
+    lineStart: (info.line_ends || [])[0] || 'none',
+    lineEnd:   (info.line_ends || [])[1] || 'none',
+    closed:    info.tool === 'polygon' ? !!info.closed : true,
+    highlighter: !!info.highlighter,
   };
 
   _draft = {
@@ -3887,7 +4135,40 @@ function _buildLiftedDraft(info, page_id) {
     replies: info.replies || [],                        // ...and its thread
     imageData: info.imageData || null,                  // image stamps: re-editable
     lifted: true, fromIdx: null, fromPageId: page_id,   // original already deleted
+    tx: 0, ty: 0,
   };
+  if (info.tool === 'callout' && info.tip) {
+    _draft.tx = info.tip[0] * scale; _draft.ty = (pageH - info.tip[1]) * scale;
+  }
+  if (info.tool === 'polygon' && info.vertices) {
+    _draft.kind = 'poly';
+    _draft.verts = [];
+    for (let i = 0; i + 1 < info.vertices.length; i += 2)
+      _draft.verts.push([info.vertices[i] * scale, (pageH - info.vertices[i + 1]) * scale]);
+  }
+  if (info.tool === 'pen' && info.strokes) {
+    _draft.kind = 'ink';
+    _draft.strokes = info.strokes.map(st => {
+      const out = [];
+      for (let i = 0; i + 1 < st.length; i += 2) out.push([st[i] * scale, (pageH - st[i + 1]) * scale]);
+      return out;
+    });
+  }
+  if (info.tool === 'stamp' && info.stamp) {
+    _draft.stamp = Object.assign({}, info.stamp);
+    // The panel shows the lifted stamp's kind and colour; picking another
+    // preset restyles this stamp (selectStampPreset -> _stampRestyleDraft).
+    _stampKey = info.stamp.key || 'custom';
+    document.querySelectorAll('#at-stamp-props .at-stamp-opt').forEach(b =>
+      b.classList.toggle('active', b.dataset.key === _stampKey));
+    const cust = document.getElementById('at-stamp-custom-row');
+    if (cust) cust.style.display = _stampKey === 'custom' ? '' : 'none';
+    const ce = document.getElementById('at-stamp-custom');
+    if (ce && _stampKey === 'custom') ce.value = info.stamp.label || '';
+    const toHex = (c) => '#' + c.map(v => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
+    const colEl = document.getElementById('at-stamp-color');
+    if (colEl && info.stamp.color) colEl.value = toHex(info.stamp.color);
+  }
 
   if (isLine) {
     _draft.x1 = info.line[0] * scale; _draft.y1 = (pageH - info.line[1]) * scale;
@@ -3901,7 +4182,7 @@ function _buildLiftedDraft(info, page_id) {
   }
 
   _syncToolControlsFromStyle(style, info.tool);   // reflect the lifted style in the panel
-  if (info.tool === 'text') {
+  if (_isTextBoxTool(info.tool)) {
     _attachTextInput();
     if (_draft.textInput) { _draft.textInput.value = info.text || ''; _fitTextHeight(); }
   }
@@ -3909,6 +4190,10 @@ function _buildLiftedDraft(info, page_id) {
   _draft.snap = {
     x: _draft.x, y: _draft.y, w: _draft.w, h: _draft.h,
     x1: _draft.x1, y1: _draft.y1, x2: _draft.x2, y2: _draft.y2,
+    tx: _draft.tx, ty: _draft.ty,
+    stamp: _draft.stamp ? JSON.parse(JSON.stringify(_draft.stamp)) : null,
+    verts: _draft.verts ? _draft.verts.map(p => p.slice()) : null,
+    strokes: _draft.strokes ? _draft.strokes.map(st => st.map(p => p.slice())) : null,
     style: JSON.parse(JSON.stringify(style)), text: info.text || '',
   };
   _draftRender(); _syncTextInput();
@@ -3921,7 +4206,7 @@ function _syncToolControlsFromStyle(style, tool) {
   const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
   const toHex = (c) => '#' + c.map(x => Math.round(Math.max(0, Math.min(1, x)) * 255)
                                        .toString(16).padStart(2, '0')).join('');
-  if (tool === 'text') {
+  if (_isTextBoxTool(tool)) {
     set('at-text-color', toHex(style.textColor));
     set('at-text-size', Math.round(style.fontSize));
     if (style.font) set('at-text-font', style.font);
@@ -3937,6 +4222,12 @@ function _syncToolControlsFromStyle(style, tool) {
     set('at-line-weight', style.lineWidth);
     set('at-line-style',  style.lineStyle || 'solid');
   }
+  set('at-line-start', style.lineStart || 'none');
+  set('at-line-end',   style.lineEnd   || 'none');
+  const pc = document.getElementById('at-poly-closed');
+  if (pc && tool === 'polygon') pc.checked = style.closed !== false;
+  const ph = document.getElementById('at-pen-hl');
+  if (ph && tool === 'pen') ph.checked = !!style.highlighter;
   // Fill (rect/ellipse) — reflect the lifted shape's interior so a re-commit keeps it.
   const fillOnEl = document.getElementById('at-fill-on');
   if (fillOnEl) fillOnEl.checked = !!style.fillOn;
@@ -4010,7 +4301,7 @@ function _queueAnnotOp(fn) {
 // rather than laying an object on top of it, so it does not go through the
 // draft/commitDraft machinery — see _annotMouseDown, which hands 'formfield'
 // off to its own drag before any draft is created.
-const _TOOL_IDS = ['text', 'ellipse', 'rect', 'line', 'arrow', 'darrow', 'cloud', 'highlight', 'sticky', 'image', 'signature',
+const _TOOL_IDS = ['text', 'callout', 'stamp', 'ellipse', 'rect', 'line', 'polygon', 'pen', 'highlight', 'sticky', 'image', 'signature',
                    'formfield', 'redact', 'watermark', 'crop',
                    'pagetext', 'edittext'];
 // Watermark is a page tool but NOT a drag tool: it takes no geometry (the
@@ -4025,6 +4316,110 @@ function _isPageTool(tool) { return _PAGE_TOOL_IDS.indexOf(tool) !== -1; }
 // differing only in which ends carry a head.
 function _isLineTool(tool) {
   return tool === 'line' || tool === 'arrow' || tool === 'darrow';
+}
+
+// Tools whose draft is a text box with the inline editor: Text, and Callout
+// (a text box plus a leader line to a tip point, _draft.tx/ty in block px).
+function _isTextBoxTool(tool) { return tool === 'text' || tool === 'callout'; }
+
+// Callout leader — MUST match viewer.py _callout_leader (the preview is the
+// result).  PDF points, y up: box [x1,y1,x2,y2], tip [x,y] → {end, knee}.  The
+// leader leaves the middle of the box side facing the tip (left/right when the
+// tip is beside the box, else top/bottom); the knee stands 12pt out from it.
+const _CALLOUT_KNEE_PT = 12;
+function _calloutLeader(box, tip) {
+  const [x1, y1, x2, y2] = box, [tx, ty] = tip;
+  const xm = (x1 + x2) / 2, ym = (y1 + y2) / 2, k = _CALLOUT_KNEE_PT;
+  if (tx < x1) return { end: [x1, ym], knee: [x1 - k, ym] };
+  if (tx > x2) return { end: [x2, ym], knee: [x2 + k, ym] };
+  if (ty > y2) return { end: [xm, y2], knee: [xm, y2 + k] };
+  return { end: [xm, y1], knee: [xm, y1 - k] };
+}
+
+// The same leader for a live draft, in block px (y down).
+function _calloutLeaderPx(d) {
+  const sc = d.scale, H = d.st.pageH;
+  const box = [d.x / sc, H - (d.y + d.h) / sc, (d.x + d.w) / sc, H - d.y / sc];
+  const L = _calloutLeader(box, [d.tx / sc, H - d.ty / sc]);
+  const px = (p) => [p[0] * sc, (H - p[1]) * sc];
+  return { end: px(L.end), knee: px(L.knee) };
+}
+
+// ── Review stamps (v3.5) ─────────────────────────────────────────────────────
+// APPROVED, REJECTED, ... drawn by the server as a vector /Stamp (see viewer.py
+// "Review stamps").  The label is the UI language's (stamp.<key>), so a German
+// reviewer stamps GENEHMIGT; Custom takes the typed text.  The second line is
+// the Name field and today's date, baked in when the stamp is placed — the
+// way every viewer's "dynamic" stamps work.
+const _STAMP_PRESETS = [
+  ['approved',        [0.12, 0.55, 0.23]],
+  ['rejected',        [0.78, 0.16, 0.16]],
+  ['reviewed',        [0.08, 0.40, 0.75]],
+  ['revised',         [0.94, 0.42, 0.00]],
+  ['for_construction',[0.12, 0.55, 0.23]],
+  ['for_information', [0.08, 0.40, 0.75]],
+  ['draft',           [0.33, 0.43, 0.48]],
+  ['confidential',    [0.78, 0.16, 0.16]],
+  ['void',            [0.78, 0.16, 0.16]],
+  ['custom',          [0.08, 0.40, 0.75]],
+];
+let _stampKey = 'approved';
+
+function _stampPresetColor(key) {
+  const p = _STAMP_PRESETS.find(x => x[0] === key);
+  return p ? p[1].slice() : [0.08, 0.40, 0.75];
+}
+
+// Today's date in the user's own format (no time: a stamp says WHEN, not to
+// the minute).
+function _stampDate() {
+  try { return new Date().toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }); }
+  catch (_) { return new Date().toISOString().slice(0, 10); }
+}
+
+// The stamp the panel describes right now, or null (Custom with no text).
+function _stampFromPanel() {
+  const key = _stampKey;
+  const label = (key === 'custom'
+    ? (_ctlVal('at-stamp-custom', '') || '').trim()
+    : window.t('stamp.' + key)).toUpperCase();
+  if (!label) return null;
+  const withSub = !!(document.getElementById('at-stamp-sub') || {}).checked;
+  const who = _reviewer();
+  const sub = withSub ? (who ? who + ' \u00b7 ' + _stampDate() : _stampDate()) : '';
+  const col = _hexToRgb01(_ctlVal('at-stamp-color', '#1e8c3a'));
+  return { key, label, sub, color: col };
+}
+
+// Picking a preset: remember it, set its colour, show the Custom box when
+// needed — and, if a stamp is being edited, restyle THAT stamp (keeping its
+// name/date line: re-dating an old approval would be wrong).
+function selectStampPreset(key) {
+  _stampKey = key;
+  document.querySelectorAll('#at-stamp-props .at-stamp-opt').forEach(b =>
+    b.classList.toggle('active', b.dataset.key === key));
+  const toHex = (c) => '#' + c.map(x => Math.round(x * 255).toString(16).padStart(2, '0')).join('');
+  const colEl = document.getElementById('at-stamp-color');
+  if (colEl) colEl.value = toHex(_stampPresetColor(key));
+  const cust = document.getElementById('at-stamp-custom-row');
+  if (cust) cust.style.display = key === 'custom' ? '' : 'none';
+  _stampRestyleDraft();
+}
+
+function _stampRestyleDraft() {
+  if (!_draft || _draft.tool !== 'stamp') return;
+  const st = _stampFromPanel();
+  if (!st) return;
+  _draft.stamp = Object.assign({}, _draft.stamp || {}, { key: st.key, label: st.label,
+                                                          color: st.color });
+  _draftRender();
+}
+
+// Default size for a click: wide enough for the label at a readable size.
+function _stampDefaultSizePt(st) {
+  const len = (st.label || '').length;
+  const w = Math.max(110, Math.min(240, len * 13 + 40));
+  return { w, h: st.sub ? 46 : 36 };
 }
 
 function _hexToRgb01(hex) {
@@ -4053,6 +4448,10 @@ function _toolStyle() {
     fillOn:    !!(fillEl && fillEl.checked), // fill rect/ellipse interior?
     fillColor: _hexToRgb01(_ctlVal('at-fill-color', '#ffff00')),
     font:      _ctlVal('at-text-font', 'Helvetica'),
+    lineStart: _ctlVal('at-line-start', 'none'),     // Line / polyline ends
+    lineEnd:   _ctlVal('at-line-end',   'none'),
+    closed:    !!(document.getElementById('at-poly-closed') || {}).checked,
+    highlighter: !!(document.getElementById('at-pen-hl') || {}).checked,
   };
 }
 
@@ -4227,6 +4626,7 @@ function _armTool(tool) {
   // shape, so both fire at once and the page slides around while you draw.
   // Switch to pointer so _onViewerMouseDown defers to _annotMouseDown.
   if (viewerTool !== 'pointer') setViewerTool('pointer');
+  if (_tmSel) _tmHide();
   _activeAnnotTool = tool;
   if (_rightMode !== _tabForTool(tool)) setRightMode(_tabForTool(tool));
   if (tool !== 'image') _pendingImage = null;   // image keeps its picked file
@@ -4270,7 +4670,10 @@ function _armTool(tool) {
                    signature: 'toast.arm_signature', formfield: 'toast.arm_formfield',
                    redact: 'toast.arm_redact', watermark: 'toast.arm_watermark',
                    crop: 'toast.arm_crop', pagetext: 'toast.arm_pagetext',
-                   edittext: 'toast.arm_edittext' }[tool] || 'toast.arm_draw';
+                   edittext: 'toast.arm_edittext',
+                   callout: 'toast.arm_callout',
+                   stamp: 'toast.arm_stamp',
+                   polygon: 'toast.arm_polygon', pen: 'toast.arm_pen' }[tool] || 'toast.arm_draw';
   showToast(window.t(armKey), 'info');
 }
 
@@ -4350,6 +4753,8 @@ function _restoreLiftedOriginal() {
   const sn = _draft.snap;
   Object.assign(_draft, { x: sn.x, y: sn.y, w: sn.w, h: sn.h,
                           x1: sn.x1, y1: sn.y1, x2: sn.x2, y2: sn.y2,
+                          tx: sn.tx, ty: sn.ty,
+                          stamp: sn.stamp, verts: sn.verts, strokes: sn.strokes,
                           style: JSON.parse(JSON.stringify(sn.style)) });
   if (_draft.textInput) _draft.textInput.value = sn.text;
   commitDraft();   // re-create the original unchanged
@@ -4360,11 +4765,16 @@ function _restoreLiftedOriginal() {
 // so the panel never shows controls that do nothing (and Add text, which has its
 // own font controls, never shows a second Font row under them).
 const _STYLE_ROWS = {
-  'at-text-props': ['text'],
-  // The Text tool's Box checkbox borrows the Line colour & weight.
-  'at-line-props': ['text', 'ellipse', 'rect', 'line', 'arrow', 'darrow',
-                    'cloud', 'highlight'],
-  'at-fill-props': ['rect', 'ellipse'],
+  'at-text-props': ['text', 'callout'],
+  // The Text tool's Box checkbox borrows the Line colour & weight; a
+  // callout's box and leader are drawn in them.
+  'at-line-props': ['text', 'callout', 'ellipse', 'rect', 'line', 'arrow', 'darrow',
+                    'cloud', 'highlight', 'polygon', 'pen'],
+  'at-fill-props': ['rect', 'ellipse', 'polygon'],
+  'at-ends-props': ['line', 'polygon'],
+  'at-poly-props': ['polygon'],
+  'at-pen-props':  ['pen'],
+  'at-stamp-props': ['stamp'],
 };
 // A highlight has a colour but no stroke to weigh or dash.
 const _STROKE_ONLY = ['at-line-weight-fld', 'at-line-style-fld'];
@@ -4379,6 +4789,26 @@ function _refreshStyleRows() {
     const el = document.getElementById(id);
     if (el) el.style.display = tool === 'highlight' ? 'none' : '';
   });
+  // Polygon: an open one (a polyline) has ends and no fill; a closed one the
+  // reverse.  Cloud is a style for rectangles and closed polygons only.
+  const closed = !!(document.getElementById('at-poly-closed') || {}).checked;
+  if (tool === 'polygon') {
+    const endsRow = document.getElementById('at-ends-props');
+    if (endsRow) endsRow.style.display = closed ? 'none' : '';
+    const fillRow = document.getElementById('at-fill-props');
+    if (fillRow) fillRow.style.display = closed ? '' : 'none';
+  }
+  const styleSel = document.getElementById('at-line-style');
+  const cloudOk  = tool === 'rect' || (tool === 'polygon' && closed);
+  const cloudOpt = styleSel && styleSel.querySelector ? styleSel.querySelector('option[value="cloud"]') : null;
+  if (cloudOpt) cloudOpt.hidden = !cloudOk;
+  if (styleSel && !cloudOk && styleSel.value === 'cloud' && tool) styleSel.value = 'solid';
+  const styleFld = document.getElementById('at-line-style-fld');
+  if (styleFld && tool === 'pen') styleFld.style.display = 'none';
+  // A callout's box is always drawn, so the Text tool's Box option is not offered.
+  const boxChk = document.getElementById('at-text-box');
+  const boxLbl = boxChk && boxChk.closest ? boxChk.closest('label') : null;
+  if (boxLbl) boxLbl.style.display = tool === 'callout' ? 'none' : '';
   const hint = document.getElementById('at-idle-hint');
   if (hint) hint.style.display = (tool || _rightMode !== 'comment') ? 'none' : '';
 }
@@ -4396,7 +4826,8 @@ function _updateAnnotDeleteBtn() {
 // One-time wiring of live style controls → re-render active draft.
 function _initAnnotToolControls() {
   ['at-text-color', 'at-text-size', 'at-line-color', 'at-line-weight', 'at-line-style', 'at-text-box',
-   'at-text-font', 'at-fill-on', 'at-fill-color']
+   'at-text-font', 'at-fill-on', 'at-fill-color', 'at-line-start', 'at-line-end',
+   'at-poly-closed', 'at-pen-hl']
     .forEach(id => {
       const el = document.getElementById(id);
       if (el && !el._annotBound) {
@@ -4406,13 +4837,27 @@ function _initAnnotToolControls() {
           _draft.style = _toolStyle();
           _syncTextInput();
           // Text: re-fit height to the new font/size (re-renders); others render directly.
-          if (_draft.tool === 'text' && _draft.textInput) _fitTextHeight();
+          if (_isTextBoxTool(_draft.tool) && _draft.textInput) _fitTextHeight();
           else _draftRender();
         };
         el.addEventListener('input', handler);
         el.addEventListener('change', handler);   // checkboxes
       }
     });
+  // Close shape changes which rows apply, with or without a draft.
+  const pc = document.getElementById('at-poly-closed');
+  if (pc && !pc._rowsBound) { pc._rowsBound = true; pc.addEventListener('change', _refreshStyleRows); }
+  // Highlighter: a wide yellow nib; plain pen: back to a thin red one.
+  const hl = document.getElementById('at-pen-hl');
+  if (hl && !hl._penBound) {
+    hl._penBound = true;
+    hl.addEventListener('change', () => {
+      const wt = document.getElementById('at-line-weight'), col = document.getElementById('at-line-color');
+      if (hl.checked) { if (wt) wt.value = 12; if (col) col.value = '#ffd400'; }
+      else { if (wt && +wt.value >= 8) wt.value = 2; if (col && col.value === '#ffd400') col.value = '#ff0000'; }
+      if (_draft) { _draft.style = _toolStyle(); _draftRender(); }
+    });
+  }
 }
 // ── Your name: the author of everything the user adds ──────────────────────
 // One field for the whole Comment tab (it used to be the Sticky tool's alone),
@@ -4549,11 +4994,22 @@ function _annotMouseDown(e) {
   // Nor inside an open Add-text entry: that click places the caret.
   if (e.target.closest && e.target.closest('.pt-entry')) return;
   const block = e.target.closest('.page-block');
-  if (!block) { if (_draft) commitDraft(); return; }   // click on empty canvas → commit only
+  if (!block) {                                        // click on empty canvas → commit only
+    if (_polyDraw) _polyFinish(); else if (_draft) commitDraft();
+    return;
+  }
   const page_id = block.dataset.pageId;
   const st = _pageBlocks.get(page_id);
   if (!st?.rendered) return;
   e.preventDefault();
+
+  // Polygon: each click is a vertex of the shape being built (that draft
+  // must NOT be committed by the click, as every other tool's would be).
+  if (_activeAnnotTool === 'polygon') {
+    const bR = block.getBoundingClientRect();
+    _polyClick(page_id, st, block, e.clientX - bR.left, e.clientY - bR.top, e.detail || 1);
+    return;
+  }
 
   // Clicking the page with a draft already live → commit it first.
   if (_draft) commitDraft();
@@ -4590,6 +5046,14 @@ function _annotMouseDown(e) {
   const isLine = _isLineTool(_activeAnnotTool);
 
   _drawing = { tool: _activeAnnotTool, page_id, st, block, bRect, startX, startY, isLine };
+  // Pen: the stroke is the draft from the first point; it is written on release.
+  if (_activeAnnotTool === 'pen') {
+    _draft = _makeDraftFrom(_drawing);
+    _draft.kind = 'ink';
+    _draft.strokes = [[[startX, startY]]];
+    _drawing.previewing = true;
+    _draftRender();
+  }
   document.addEventListener('mousemove', _annotMouseMove);
   document.addEventListener('mouseup',   _annotMouseUp);
 }
@@ -4598,6 +5062,11 @@ function _annotMouseMove(e) {
   if (!_drawing) return;
   const d = _drawing;
   const cx = e.clientX - d.bRect.left, cy = e.clientY - d.bRect.top;
+  if (d.tool === 'pen' && _draft && _draft.kind === 'ink') {
+    const st = _draft.strokes[0], last = st[st.length - 1];
+    if (Math.hypot(cx - last[0], cy - last[1]) >= 1.5) { st.push([cx, cy]); _draftRender(); }
+    return;
+  }
   if (!d.previewing) {
     if (Math.abs(cx - d.startX) < 3 && Math.abs(cy - d.startY) < 3) return;
     d.previewing = true;
@@ -4618,17 +5087,53 @@ function _annotMouseUp(e) {
   const cx = e.clientX - d.bRect.left, cy = e.clientY - d.bRect.top;
   d.curX = cx; d.curY = cy;
 
+  // Pen: simplify the stroke and write it; the pen stays in the hand.
+  if (d.tool === 'pen') {
+    if (_draft && _draft.kind === 'ink') {
+      const st = _draft.strokes[0];
+      if (Math.hypot(cx - st[st.length - 1][0], cy - st[st.length - 1][1]) >= 0.5) st.push([cx, cy]);
+      _draft.strokes = [_simplifyStroke(st, 0.8)];
+      commitDraft();
+    }
+    return;
+  }
+
   if (!_draft) _draft = _makeDraftFrom(d);
   _updateDraftGeomFromDrawing();
 
+  // A stamp: a click stamps a default-size stamp centred on it; a drag stamps
+  // the dragged box.  Either way it is written straight away (like Signature)
+  // and the tool stays armed, so a run of pages can be stamped in turn.
+  if (d.tool === 'stamp') {
+    const st = _stampFromPanel();
+    if (!st) { _removeDraft(); showToast(window.t('toast.type_stamp_text'), 'error'); return; }
+    _draft.stamp = st;
+    if (!d.previewing || _draft.w < 12 || _draft.h < 8) {
+      const sz = _stampDefaultSizePt(st), sc = _draft.scale;
+      _draft.w = sz.w * sc; _draft.h = sz.h * sc;
+      _draft.x = d.startX - _draft.w / 2; _draft.y = d.startY - _draft.h / 2;
+    }
+    commitDraft();
+    return;
+  }
+
   // Reject negligible drags. Text only needs a width — its height is auto-fitted
-  // to the content, so a wide, flat drag (a single-line box) is valid.
-  const tooSmall = d.isLine
+  // to the content, so a wide, flat drag (a single-line box) is valid.  A
+  // callout needs a real drag (tip -> box): with the tool still armed, a bare
+  // click on the page is how the previous draft is accepted, and must not
+  // start another callout.
+  const tooSmall = d.tool === 'callout' ? !d.previewing : d.isLine
     ? (Math.hypot(_draft.x2 - _draft.x1, _draft.y2 - _draft.y1) < 8)
     : (d.tool === 'text' ? _draft.w < 8 : (_draft.w < 8 || _draft.h < 8));
   if (tooSmall) { _removeDraft(); return; }
 
-  if (_draft.tool === 'text') _attachTextInput();
+  if (_isTextBoxTool(_draft.tool)) _attachTextInput();
+  // Attaching the entry fits the box height to its text (growing downward):
+  // put the callout box back on the point it was placed at.
+  if (_draft && _draft.tool === 'callout') {
+    _draft.y = cy - _draft.h / 2;
+    _syncTextInput();
+  }
   _draftRender();
 }
 
@@ -4642,16 +5147,125 @@ function _makeDraftFrom(d) {
   return {
     tool: d.tool, page_id: d.page_id, st: d.st, block: d.block,
     scale: d.st.renderScale * zoomLevel, kind: d.isLine ? 'line' : 'box',
-    x: 0, y: 0, w: 0, h: 0, x1: 0, y1: 0, x2: 0, y2: 0,
+    x: 0, y: 0, w: 0, h: 0, x1: 0, y1: 0, x2: 0, y2: 0, tx: 0, ty: 0,
     svg, style: _toolStyle(), textInput: null,
     isComment: false,             // only pre-v3.2 Add-Note text was a comment
     author: _reviewer(),
     imageData: (d.tool === 'image' && _pendingImage) ? _pendingImage.dataUrl : null,
+    stamp: d.tool === 'stamp' ? _stampFromPanel() : null,
   };
+}
+
+// Default callout box: 150pt wide, one line tall (the height then fits the
+// text as it is typed).
+function _calloutBoxAt(dr, cx, cy) {
+  const sc = dr.scale, s = dr.style;
+  const w = 150 * sc;
+  const h = (2 * _textPadPt(s.fontSize) + _textLhPt(s.fontSize)) * sc;
+  dr.w = dr.w || w; dr.h = dr.h || h;
+  dr.x = (cx >= dr.tx) ? cx : cx - dr.w;
+  dr.y = cy - dr.h / 2;
+}
+
+// ── Polygon building (v3.5) ──────────────────────────────────────────────────
+// Click = a vertex; double-click, Enter, or a click on the first point (when
+// closed) finishes and writes it; Backspace drops the last point; Esc cancels.
+// The tool stays armed for the next shape, like Pen and Stamp.
+let _polyDraw = null;            // { page_id, block } while a shape is being built
+
+function _polyClick(page_id, st, block, x, y, detail) {
+  if (!_polyDraw) {
+    if (_draft) commitDraft();
+    _draft = _makeDraftFrom({ tool: 'polygon', page_id, st, block, isLine: false });
+    _draft.kind = 'poly';
+    _draft.verts = [[x, y]];
+    _draft.cursor = [x, y];
+    _draft.drawing = true;
+    _polyDraw = { page_id, block };
+    document.addEventListener('mousemove', _polyMove);
+    _draftRender();
+    return;
+  }
+  if (_polyDraw.page_id !== page_id || !_draft) { _polyFinish(); return; }
+  const v = _draft.verts, first = v[0], last = v[v.length - 1];
+  if (detail >= 2) { _polyFinish(); return; }          // the 2nd click of a double-click
+  if (_draft.style.closed && v.length >= 3 && Math.hypot(x - first[0], y - first[1]) < 14) {
+    _polyFinish(); return;
+  }
+  if (Math.hypot(x - last[0], y - last[1]) < 3) return; // no zero-length edges
+  v.push([x, y]);
+  _draft.cursor = [x, y];
+  _draftRender();
+}
+
+function _polyMove(e) {
+  if (!_polyDraw || !_draft || !_draft.drawing) return;
+  const r = _polyDraw.block.getBoundingClientRect();
+  _draft.cursor = [e.clientX - r.left, e.clientY - r.top];
+  _draftRender();
+}
+
+function _polyStop() {
+  document.removeEventListener('mousemove', _polyMove);
+  _polyDraw = null;
+}
+
+function _polyFinish() {
+  if (!_draft || _draft.kind !== 'poly') { _polyStop(); return; }
+  _polyStop();
+  _draft.drawing = false;
+  _draft.cursor = null;
+  const need = _draft.style.closed ? 3 : 2;
+  if (_draft.verts.length < need) {
+    _removeDraft();
+    showToast(window.t('toast.polygon_needs_points'), 'info');
+    return;
+  }
+  commitDraft();
+}
+
+// Keys while a shape is being built — capture phase, ahead of the general
+// draft keys (Enter would commit half a shape, Delete would discard it).
+document.addEventListener('keydown', (e) => {
+  if (!_polyDraw || !_draft || _draft.kind !== 'poly') return;
+  if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); _polyFinish(); }
+  else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); _polyStop(); _removeDraft(); }
+  else if (e.key === 'Backspace' || e.key === 'Delete') {
+    e.preventDefault(); e.stopPropagation();
+    if (_draft.verts.length > 1) { _draft.verts.pop(); _draftRender(); }
+    else { _polyStop(); _removeDraft(); }
+  }
+}, true);
+
+// Ramer–Douglas–Peucker: drop points within *eps* px of the line through
+// their neighbours.  A freehand stroke samples every mousemove; most of those
+// points add nothing but size to the PDF.
+function _simplifyStroke(pts, eps) {
+  if (pts.length < 3) return pts.slice();
+  const keep = new Array(pts.length).fill(false);
+  keep[0] = keep[pts.length - 1] = true;
+  const stack = [[0, pts.length - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    const [ax, ay] = pts[a], [bx, by] = pts[b];
+    const L = Math.hypot(bx - ax, by - ay) || 1e-9;
+    let best = -1, bi = -1;
+    for (let i = a + 1; i < b; i++) {
+      const d = Math.abs((bx - ax) * (ay - pts[i][1]) - (ax - pts[i][0]) * (by - ay)) / L;
+      if (d > best) { best = d; bi = i; }
+    }
+    if (best > eps) { keep[bi] = true; stack.push([a, bi], [bi, b]); }
+  }
+  return pts.filter((_, i) => keep[i]);
 }
 
 function _updateDraftGeomFromDrawing() {
   const d = _drawing; if (!d || !_draft) return;
+  if (d.tool === 'callout') {
+    _draft.tx = d.startX; _draft.ty = d.startY;
+    _calloutBoxAt(_draft, d.curX, d.curY);
+    return;
+  }
   if (d.isLine) {
     _draft.x1 = d.startX; _draft.y1 = d.startY;
     _draft.x2 = d.curX;   _draft.y2 = d.curY;
@@ -4693,12 +5307,81 @@ function _draftRender() {
     ln.style.cursor = 'move';
     ln.addEventListener('mousedown', ev => _draftStartDrag(ev, 'move'));
     svg.appendChild(ln);
-    if (_draft.tool === 'arrow' || _draft.tool === 'darrow')
-      _drawArrowHead(svg, _draft.x1, _draft.y1, _draft.x2, _draft.y2, stroke, swDisp);
-    if (_draft.tool === 'darrow')   // second head, pointing back at the start
-      _drawArrowHead(svg, _draft.x2, _draft.y2, _draft.x1, _draft.y1, stroke, swDisp);
+    const ends = _draftLineEnds(_draft);
+    _drawLineEnd(svg, ends[1], _draft.x2, _draft.y2, _draft.x1, _draft.y1, stroke, swDisp);
+    _drawLineEnd(svg, ends[0], _draft.x1, _draft.y1, _draft.x2, _draft.y2, stroke, swDisp);
     _addHandle(svg, _draft.x1, _draft.y1, 'p1');
     _addHandle(svg, _draft.x2, _draft.y2, 'p2');
+    return;
+  }
+
+  // Polygon / polyline (v3.5): click-built vertices, then vertex handles.
+  if (_draft.kind === 'poly') {
+    const v = _draft.verts || [], closed = !!s.closed;
+    const pts = _draft.drawing && _draft.cursor ? v.concat([_draft.cursor]) : v;
+    if (!pts.length) return;
+    // While building, a closed cloud previews as the cloud it will be (with
+    // the closing edge to the pointer) — straight lines read as "Cloud not working".
+    const cloud = closed && s.lineStyle === 'cloud' && pts.length >= 3;
+    const path = document.createElementNS(NS_SVG, 'path');
+    path.setAttribute('d', cloud ? _cloudPolyD(pts, _cloudArcPx(pts, _draft.scale))
+      : 'M' + pts.map(p => p[0] + ',' + p[1]).join(' L') + (closed ? ' Z' : ''));
+    path.setAttribute('fill', (closed && !cloud && !_draft.drawing && s.fillOn && s.fillColor)
+                              ? _rgbCss(s.fillColor) : 'none');
+    path.setAttribute('stroke', stroke);
+    path.setAttribute('stroke-width', swDisp);
+    path.setAttribute('stroke-linejoin', 'round');
+    path.setAttribute('stroke-linecap', 'round');
+    if (dashes && !cloud) path.setAttribute('stroke-dasharray', dashes);
+    path.style.pointerEvents = _draft.drawing ? 'none' : (closed ? 'all' : 'stroke');
+    path.style.cursor = 'move';
+    if (!_draft.drawing) path.addEventListener('mousedown', ev => _draftStartDrag(ev, 'move'));
+    svg.appendChild(path);
+    if (!closed && pts.length >= 2) {
+      const n = pts.length;
+      _drawLineEnd(svg, s.lineStart, pts[0][0], pts[0][1], pts[1][0], pts[1][1], stroke, swDisp);
+      _drawLineEnd(svg, s.lineEnd, pts[n - 1][0], pts[n - 1][1], pts[n - 2][0], pts[n - 2][1], stroke, swDisp);
+    }
+    if (!_draft.drawing) v.forEach((p, i) => _addHandle(svg, p[0], p[1], 'v' + i));
+    else if (v.length) {
+      // The first corner, while building: a big CLOSE target.  It used to be a
+      // draggable handle, so clicking it dragged the corner instead of closing.
+      const c = document.createElementNS(NS_SVG, 'circle');
+      c.setAttribute('cx', v[0][0]); c.setAttribute('cy', v[0][1]);
+      c.setAttribute('r', closed && v.length >= 3 ? 9 : 5);
+      c.setAttribute('class', 'poly-close-target');
+      c.setAttribute('fill', closed && v.length >= 3 ? 'rgba(46,204,113,0.35)' : '#fff');
+      c.setAttribute('stroke', closed && v.length >= 3 ? '#2ecc71' : stroke);
+      c.setAttribute('stroke-width', 2);
+      c.style.pointerEvents = 'all';
+      c.style.cursor = closed && v.length >= 3 ? 'pointer' : 'crosshair';
+      c.addEventListener('mousedown', ev => {
+        ev.preventDefault(); ev.stopPropagation();
+        if (_draft && _draft.style.closed && _draft.verts.length >= 3) _polyFinish();
+      });
+      svg.appendChild(c);
+    }
+    return;
+  }
+
+  // Pen (v3.5): freehand strokes; the highlighter is wide and translucent.
+  if (_draft.kind === 'ink') {
+    (_draft.strokes || []).forEach(st => {
+      if (!st.length) return;
+      const pl = document.createElementNS(NS_SVG, 'polyline');
+      const pts = st.length === 1 ? [st[0], [st[0][0] + 0.01, st[0][1]]] : st;
+      pl.setAttribute('points', pts.map(p => p[0] + ',' + p[1]).join(' '));
+      pl.setAttribute('fill', 'none');
+      pl.setAttribute('stroke', stroke);
+      pl.setAttribute('stroke-width', swDisp);
+      pl.setAttribute('stroke-linecap', 'round');
+      pl.setAttribute('stroke-linejoin', 'round');
+      if (s.highlighter) pl.setAttribute('stroke-opacity', '0.35');
+      pl.style.pointerEvents = _drawing ? 'none' : 'stroke';
+      pl.style.cursor = 'move';
+      pl.addEventListener('mousedown', ev => _draftStartDrag(ev, 'move'));
+      svg.appendChild(pl);
+    });
     return;
   }
 
@@ -4724,6 +5407,74 @@ function _draftRender() {
     return;
   }
 
+  // Callout leader: tip → knee → the box side facing the tip, open arrowhead
+  // at the tip (drawn first, under the box).
+  if (_draft.tool === 'callout') {
+    const L = _calloutLeaderPx(_draft);
+    const pl = document.createElementNS(NS_SVG, 'polyline');
+    pl.setAttribute('points', `${_draft.tx},${_draft.ty} ${L.knee[0]},${L.knee[1]} ${L.end[0]},${L.end[1]}`);
+    pl.setAttribute('fill', 'none');
+    pl.setAttribute('stroke', stroke);
+    pl.setAttribute('stroke-width', swDisp);
+    pl.setAttribute('stroke-linecap', 'round');
+    pl.setAttribute('stroke-linejoin', 'round');
+    pl.style.pointerEvents = 'stroke';
+    pl.style.cursor = 'move';
+    pl.addEventListener('mousedown', ev => _draftStartDrag(ev, 'move'));
+    svg.appendChild(pl);
+    _drawArrowHead(svg, L.knee[0], L.knee[1], _draft.tx, _draft.ty, stroke, swDisp);
+  }
+
+  // Review stamp: frame + label + line 2, approximating the server's layout
+  // (the PDF is the truth; this is the preview while placing / editing).
+  if (_draft.tool === 'stamp' && _draft.stamp) {
+    const sp = _draft.stamp, col = _rgbCss(sp.color || [0.12, 0.55, 0.23]);
+    const fr = document.createElementNS(NS_SVG, 'rect');
+    const lw = Math.max(1.2, Math.min(4, (h / _draft.scale) * 0.05)) * _draft.scale;
+    fr.setAttribute('x', x + lw / 2); fr.setAttribute('y', y + lw / 2);
+    fr.setAttribute('width', Math.max(0, w - lw)); fr.setAttribute('height', Math.max(0, h - lw));
+    fr.setAttribute('rx', Math.min(h * 0.18, w * 0.1, 10 * _draft.scale));
+    fr.setAttribute('fill', 'rgba(255,255,255,0.001)');
+    fr.setAttribute('stroke', col); fr.setAttribute('stroke-width', lw);
+    fr.style.pointerEvents = 'all'; fr.style.cursor = 'move';
+    fr.addEventListener('mousedown', ev => _draftStartDrag(ev, 'move'));
+    svg.appendChild(fr);
+    const lines = [[sp.label, sp.sub ? 0.46 : 0.6, '700']];
+    if (sp.sub) lines.push([sp.sub, 0.2, '400']);
+    const s1 = h * lines[0][1], s2 = sp.sub ? Math.min(h * 0.2, s1 * 0.55) : 0;
+    const gap = sp.sub ? s1 * 0.3 : 0;
+    const block = s1 * 0.72 + (sp.sub ? gap + s2 * 0.72 : 0);
+    const base1 = y + (h - block) / 2 + s1 * 0.72;
+    [[sp.label, s1, '700', base1], sp.sub ? [sp.sub, s2, '400', base1 + gap + s2 * 0.72] : null]
+      .filter(Boolean).forEach(([txt, size, weight, base]) => {
+        const t = document.createElementNS(NS_SVG, 'text');
+        t.setAttribute('x', x + w / 2); t.setAttribute('y', base);
+        t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('font-family', 'Helvetica, Arial, sans-serif');
+        t.setAttribute('font-weight', weight);
+        t.setAttribute('font-size', size);
+        t.setAttribute('fill', col);
+        // Never wider than the frame — the server fits the same way.
+        t.setAttribute('textLength', Math.max(1, w - 2 * (lw + Math.max(4 * _draft.scale, h * 0.14))));
+        t.setAttribute('lengthAdjust', 'spacingAndGlyphs');
+        t.style.pointerEvents = 'none';
+        t.textContent = txt;
+        svg.appendChild(t);
+        // textLength STRETCHES short text too; only squeeze when it overflows.
+        try {
+          const natural = t.getComputedTextLength ? t.getComputedTextLength() : 0;
+          if (natural && natural <= parseFloat(t.getAttribute('textLength'))) {
+            t.removeAttribute('textLength'); t.removeAttribute('lengthAdjust');
+          }
+        } catch (_) {}
+      });
+    _addHandle(svg, x,     y,     'nw');
+    _addHandle(svg, x + w, y,     'ne');
+    _addHandle(svg, x,     y + h, 'sw');
+    _addHandle(svg, x + w, y + h, 'se');
+    return;
+  }
+
   // Interior fill — rect & ellipse only (cloud is stroke-only; text/highlight
   // manage their own fill). Mirrors the server's /IC handling.
   const fillCss = (s.fillOn && s.fillColor) ? _rgbCss(s.fillColor) : 'none';
@@ -4736,7 +5487,7 @@ function _draftRender() {
     shape.setAttribute('stroke', stroke);
     shape.setAttribute('stroke-width', swDisp);
     if (dashes) shape.setAttribute('stroke-dasharray', dashes);
-  } else if (_draft.tool === 'cloud') {
+  } else if (_draft.tool === 'cloud' || (_draft.tool === 'rect' && s.lineStyle === 'cloud')) {
     shape = document.createElementNS(NS_SVG, 'path');
     const arc = Math.max(8, Math.min(28, Math.min(w, h) / 4)) || 12;
     shape.setAttribute('d', _cloudPathD(x, y, w, h, arc));
@@ -4755,7 +5506,8 @@ function _draftRender() {
     shape = document.createElementNS(NS_SVG, 'rect');
     shape.setAttribute('x', x); shape.setAttribute('y', y);
     shape.setAttribute('width', w); shape.setAttribute('height', h);
-    shape.setAttribute('fill', _draft.tool === 'text' ? 'rgba(0,0,0,0.001)' : fillCss);
+    shape.setAttribute('fill', _isTextBoxTool(_draft.tool) ? 'rgba(0,0,0,0.001)' : fillCss);
+    // A callout's box is always drawn (in the line colour and weight).
     if (_draft.tool === 'text' && !s.textBox) {
       // No box requested → show a faint dashed guide while editing only
       // (this guide is NOT part of the committed annotation).
@@ -4787,9 +5539,11 @@ function _draftRender() {
   // text), so they expose left/right WIDTH handles only — changing the width
   // re-wraps the text and the height re-fits. Every other box tool keeps the
   // 4 corner handles for free width+height resizing.
-  if (_draft.tool === 'text') {
+  if (_isTextBoxTool(_draft.tool)) {
     _addHandle(svg, x,     y + h / 2, 'w');
     _addHandle(svg, x + w, y + h / 2, 'e');
+    // The callout's tip moves on its own; moving the box leaves it anchored.
+    if (_draft.tool === 'callout') _addHandle(svg, _draft.tx, _draft.ty, 'tip');
   } else {
     _addHandle(svg, x,     y,     'nw');
     _addHandle(svg, x + w, y,     'ne');
@@ -4827,6 +5581,95 @@ function _cloudPathD(bx, by, w, h, arc) {
     d += ` C${c1x.toFixed(2)},${c1y.toFixed(2)} ${c2x.toFixed(2)},${c2y.toFixed(2)} ${ex.toFixed(2)},${ey.toFixed(2)}`;
   });
   return d + ' Z';
+}
+
+// The ends a line-like draft carries: the Line tool's own choice, or the
+// fixed heads of the pre-v3.5 Arrow / Dbl Arrow drafts.
+function _draftLineEnds(d) {
+  if (d.tool === 'arrow')  return ['none', 'open'];
+  if (d.tool === 'darrow') return ['open', 'open'];
+  return [d.style.lineStart || 'none', d.style.lineEnd || 'none'];
+}
+
+// Preview of a line end at (tx,ty), the line arriving from (fx,fy) — mirrors
+// viewer.py _line_end_ops (closed shapes filled in the line colour).
+function _drawLineEnd(svg, kind, tx, ty, fx, fy, stroke, sw) {
+  if (!kind || kind === 'none') return;
+  if (kind === 'open') { _drawArrowHead(svg, fx, fy, tx, ty, stroke, sw); return; }
+  const size = Math.max(10, sw * 4);
+  const ang = Math.atan2(ty - fy, tx - fx);
+  const mk = (tag, attrs) => {
+    const el = document.createElementNS(NS_SVG, tag);
+    Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+    el.style.pointerEvents = 'none';
+    svg.appendChild(el);
+  };
+  if (kind === 'closed') {
+    const sp = 28 * Math.PI / 180;
+    const a = [tx - size * Math.cos(ang + sp), ty - size * Math.sin(ang + sp)];
+    const b = [tx - size * Math.cos(ang - sp), ty - size * Math.sin(ang - sp)];
+    mk('polygon', { points: `${tx},${ty} ${a[0]},${a[1]} ${b[0]},${b[1]}`, fill: stroke,
+                    stroke, 'stroke-width': sw, 'stroke-linejoin': 'round' });
+  } else if (kind === 'circle') {
+    mk('circle', { cx: tx, cy: ty, r: size * 0.35, fill: stroke });
+  } else if (kind === 'square') {
+    const r = size * 0.35;
+    mk('rect', { x: tx - r, y: ty - r, width: 2 * r, height: 2 * r, fill: stroke,
+                 transform: `rotate(${ang * 180 / Math.PI} ${tx} ${ty})` });
+  } else if (kind === 'slash') {
+    const a2 = ang + Math.PI / 3, h = size * 0.5;
+    mk('line', { x1: tx - h * Math.cos(a2), y1: ty - h * Math.sin(a2),
+                 x2: tx + h * Math.cos(a2), y2: ty + h * Math.sin(a2),
+                 stroke, 'stroke-width': sw, 'stroke-linecap': 'round' });
+  }
+}
+
+// Revision cloud along a closed polygon (px) — mirrors viewer.py
+// _cloud_polygon_ops: bumps face OUTWARD whichever way round it was drawn.
+function _cloudPolyD(pts, arc) {
+  const n = pts.length;
+  let a2 = 0;
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], q = pts[(i + 1) % n];
+    a2 += p[0] * q[1] - q[0] * p[1];
+  }
+  const sgn = a2 > 0 ? 1 : -1;
+  const segs = [];
+  for (let i = 0; i < n; i++) {
+    const [sx, sy] = pts[i], [ex, ey] = pts[(i + 1) % n];
+    const L = Math.hypot(ex - sx, ey - sy);
+    if (L < 1e-6) continue;
+    const k = Math.max(1, Math.round(L / (arc * 2)));
+    for (let j = 0; j < k; j++) {
+      segs.push([sx + (ex - sx) * j / k, sy + (ey - sy) * j / k,
+                 sx + (ex - sx) * (j + 1) / k, sy + (ey - sy) * (j + 1) / k]);
+    }
+  }
+  if (!segs.length) return '';
+  let d = `M${segs[0][0].toFixed(2)},${segs[0][1].toFixed(2)}`;
+  segs.forEach(([sx, sy, ex, ey]) => {
+    const dl = Math.hypot(ex - sx, ey - sy) || 1;
+    const tx = (ex - sx) / dl, ty = (ey - sy) / dl;
+    const nx = ty * sgn, ny = -tx * sgn, r = dl / 2, bulge = r * 0.75, tang = r * 0.5;
+    d += ` C${(sx + tx * tang + nx * bulge).toFixed(2)},${(sy + ty * tang + ny * bulge).toFixed(2)}` +
+         ` ${(ex - tx * tang + nx * bulge).toFixed(2)},${(ey - ty * tang + ny * bulge).toFixed(2)}` +
+         ` ${ex.toFixed(2)},${ey.toFixed(2)}`;
+  });
+  return d + ' Z';
+}
+
+// Cloud arc for a point set: viewer.py _cloud_arc_for, in px.
+function _cloudArcPx(pts, scale) {
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const m = Math.min(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys)) / scale;
+  return Math.max(6, Math.min(16, m / 4 || 10)) * scale;
+}
+
+// Every point of a vertex / ink draft (px).
+function _draftPoints(d) {
+  if (d.kind === 'poly') return d.verts || [];
+  if (d.kind === 'ink')  return [].concat(...(d.strokes || []));
+  return [];
 }
 
 function _drawArrowHead(svg, x1, y1, x2, y2, stroke, sw) {
@@ -4911,10 +5754,15 @@ function _updateDragGuides() {
   if (!_guideSvg || !_draft) return;
   // Lines are a bbox for both kinds: endpoint extents for line/arrow drafts,
   // the box itself for everything else.
-  const left   = _draft.kind === 'line' ? Math.min(_draft.x1, _draft.x2) : _draft.x;
-  const right  = _draft.kind === 'line' ? Math.max(_draft.x1, _draft.x2) : _draft.x + _draft.w;
-  const top    = _draft.kind === 'line' ? Math.min(_draft.y1, _draft.y2) : _draft.y;
-  const bottom = _draft.kind === 'line' ? Math.max(_draft.y1, _draft.y2) : _draft.y + _draft.h;
+  let left   = _draft.kind === 'line' ? Math.min(_draft.x1, _draft.x2) : _draft.x;
+  let right  = _draft.kind === 'line' ? Math.max(_draft.x1, _draft.x2) : _draft.x + _draft.w;
+  let top    = _draft.kind === 'line' ? Math.min(_draft.y1, _draft.y2) : _draft.y;
+  let bottom = _draft.kind === 'line' ? Math.max(_draft.y1, _draft.y2) : _draft.y + _draft.h;
+  const pts = _draftPoints(_draft);
+  if (pts.length) {
+    left = Math.min(...pts.map(p => p[0])); right  = Math.max(...pts.map(p => p[0]));
+    top  = Math.min(...pts.map(p => p[1])); bottom = Math.max(...pts.map(p => p[1]));
+  }
 
   const pw = _guideSvg.getAttribute('width'), ph = _guideSvg.getAttribute('height');
   // Half-pixel offsets keep the 1px strokes on a device pixel (no blur).
@@ -4939,7 +5787,10 @@ function _draftStartDrag(e, mode, key) {
   if (!_draft) return;
   e.preventDefault(); e.stopPropagation();
   const snap = { x: _draft.x, y: _draft.y, w: _draft.w, h: _draft.h,
-                 x1: _draft.x1, y1: _draft.y1, x2: _draft.x2, y2: _draft.y2 };
+                 x1: _draft.x1, y1: _draft.y1, x2: _draft.x2, y2: _draft.y2,
+                 tx: _draft.tx, ty: _draft.ty,
+                 verts: _draft.verts ? _draft.verts.map(p => p.slice()) : null,
+                 strokes: _draft.strokes ? _draft.strokes.map(st => st.map(p => p.slice())) : null };
   const mx = e.clientX, my = e.clientY;
   function mm(ev) {
     const dx = ev.clientX - mx, dy = ev.clientY - my;
@@ -4947,7 +5798,7 @@ function _draftStartDrag(e, mode, key) {
     // Text: a width change re-wraps the text, so re-fit the height live; a move
     // just repositions. _fitTextHeight() re-renders for us. Other tools render
     // directly.
-    if (_draft.tool === 'text' && _draft.textInput) { _syncTextInput(); _fitTextHeight(); }
+    if (_isTextBoxTool(_draft.tool) && _draft.textInput) { _syncTextInput(); _fitTextHeight(); }
     else { _draftRender(); _syncTextInput(); }
     // After the refit above, so the guides track the final height.
     _showDragGuides();
@@ -4963,6 +5814,17 @@ function _draftStartDrag(e, mode, key) {
 }
 
 function _applyDrag(mode, key, g, dx, dy) {
+  if (_draft.kind === 'poly' || _draft.kind === 'ink') {
+    const mv = (p) => [p[0] + dx, p[1] + dy];
+    if (mode === 'move') {
+      if (g.verts)   _draft.verts   = g.verts.map(mv);
+      if (g.strokes) _draft.strokes = g.strokes.map(st => st.map(mv));
+    } else if (key && key[0] === 'v' && g.verts) {
+      const i = +key.slice(1);
+      _draft.verts = g.verts.map((p, j) => j === i ? mv(p) : p.slice());
+    }
+    return;
+  }
   if (_draft.kind === 'line') {
     if (mode === 'move') {
       _draft.x1 = g.x1 + dx; _draft.y1 = g.y1 + dy;
@@ -4972,6 +5834,10 @@ function _applyDrag(mode, key, g, dx, dy) {
     } else {
       _draft.x2 = g.x2 + dx; _draft.y2 = g.y2 + dy;
     }
+    return;
+  }
+  if (key === 'tip') {                   // callout: only the tip moves
+    _draft.tx = g.tx + dx; _draft.ty = g.ty + dy;
     return;
   }
   let left = g.x, top = g.y, right = g.x + g.w, bottom = g.y + g.h;
@@ -4991,7 +5857,7 @@ function _applyDrag(mode, key, g, dx, dy) {
 
 // ── Inline text editor for the Text tool ────────────────────────────────────
 function _attachTextInput() {
-  if (!_draft || _draft.tool !== 'text') return;
+  if (!_draft || !_isTextBoxTool(_draft.tool)) return;
   const ta = document.createElement('textarea');
   ta.className = 'annot-draft annot-text-input';
   ta.value = '';
@@ -5047,7 +5913,7 @@ function _wrapCount(para, cpl) {
 // untouched (the user controls it via the drag / side handles). Re-renders the
 // box + handles so they track the new height.
 function _fitTextHeight() {
-  if (!_draft || _draft.tool !== 'text' || !_draft.textInput) return;
+  if (!_draft || !_isTextBoxTool(_draft.tool) || !_draft.textInput) return;
   const ta = _draft.textInput, s = _draft.style, scale = _draft.scale;
   const padPt = _textPadPt(s.fontSize), lhPt = _textLhPt(s.fontSize);
 
@@ -5074,6 +5940,7 @@ function _fitTextHeight() {
 
 function _removeDraft() {
   _hideDragGuides();   // a draft torn down mid-drag must not strand its guides
+  if (_polyDraw) _polyStop();
   if (!_draft) return;
   if (_draft.svg)       _draft.svg.remove();
   if (_draft.textInput) _draft.textInput.remove();
@@ -5092,11 +5959,13 @@ function _draftToAddBody(d) {
   const s = d.style;
   const scale = d.scale, pageH = d.st.pageH;
 
-  const subtypeMap = { text:'FreeText', rect:'Square', ellipse:'Circle',
+  const subtypeMap = { text:'FreeText', callout:'FreeText', rect:'Square', ellipse:'Circle',
                        line:'Line', arrow:'Line', darrow:'Line', cloud:'Polygon',
-                       highlight:'Highlight', image:'Stamp' };
+                       highlight:'Highlight', image:'Stamp', stamp:'Stamp',
+                       polygon:'Polygon', pen:'Ink' };
   const subtype = subtypeMap[d.tool];
   if (!subtype) return null;
+  if (d.tool === 'stamp' && !(d.stamp && d.stamp.label)) return null;
 
   const body = {
     subtype, border_color: s.lineColor, border_width: s.lineWidth,
@@ -5119,24 +5988,54 @@ function _draftToAddBody(d) {
     // Border box only when "Box" is ticked (weight clamped to ≥1); else none.
     body.border_width = s.textBox ? Math.max(1, s.lineWidth) : 0;
     body.is_comment = !!d.isComment;   // false → "dumb text", kept out of list
+  } else if (d.tool === 'callout') {
+    const text = (d.textInput ? d.textInput.value : '').trim();
+    if (!text) return null;                  // an empty callout points at nothing
+    body.rect        = [d.x/scale, pageH - (d.y + d.h)/scale,
+                        (d.x + d.w)/scale, pageH - d.y/scale];
+    body.callout_tip = [d.tx/scale, pageH - d.ty/scale];
+    body.text        = text;
+    body.text_color  = s.textColor;
+    body.font_size   = s.fontSize;
+    body.font        = s.font || 'Helvetica';
+    body.border_width = Math.max(0.5, s.lineWidth);
+    body.is_comment  = false;
+  } else if (d.tool === 'polygon') {
+    const closed = !!s.closed;
+    if (!d.verts || d.verts.length < (closed ? 3 : 2)) return null;
+    body.subtype  = closed ? 'Polygon' : 'PolyLine';
+    body.vertices = [].concat(...d.verts.map(p => [p[0] / scale, pageH - p[1] / scale]));
+    const cloud = closed && s.lineStyle === 'cloud';
+    body.border_style = cloud ? 'cloud' : (s.lineStyle === 'cloud' ? 'solid' : (s.lineStyle || 'solid'));
+    if (closed && !cloud && s.fillOn && s.fillColor) body.fill_color = s.fillColor;
+    if (!closed) body.line_ends = [s.lineStart || 'none', s.lineEnd || 'none'];
+  } else if (d.tool === 'pen') {
+    const strokes = (d.strokes || []).filter(st => st.length);
+    if (!strokes.length) return null;
+    body.ink = strokes.map(st => [].concat(...st.map(p => [p[0] / scale, pageH - p[1] / scale])));
+    body.highlighter = !!s.highlighter;
   } else if (_isLineTool(d.tool)) {
     body.line  = [d.x1/scale, pageH - d.y1/scale, d.x2/scale, pageH - d.y2/scale];
-    body.arrow       = (d.tool === 'arrow' || d.tool === 'darrow');
-    body.arrow_start = (d.tool === 'darrow');
-    body.border_style = s.lineStyle || 'solid';
+    body.line_ends   = _draftLineEnds(d);
+    body.arrow       = body.line_ends[1] !== 'none';
+    body.arrow_start = body.line_ends[0] !== 'none';
+    body.border_style = s.lineStyle === 'cloud' ? 'solid' : (s.lineStyle || 'solid');
   } else {
     body.rect = [d.x/scale, pageH - (d.y + d.h)/scale,
                  (d.x + d.w)/scale, pageH - d.y/scale];
-    // Dash style + interior fill — rect & ellipse only.
+    // Dash style + interior fill — rect & ellipse only.  Cloud is a
+    // rectangle style (the server writes the rectangle cloud), never filled.
     if (d.tool === 'rect' || d.tool === 'ellipse') {
-      body.border_style = s.lineStyle || 'solid';
-      if (s.fillOn && s.fillColor) body.fill_color = s.fillColor;
+      const cloud = d.tool === 'rect' && s.lineStyle === 'cloud';
+      body.border_style = cloud ? 'cloud' : (s.lineStyle === 'cloud' ? 'solid' : (s.lineStyle || 'solid'));
+      if (s.fillOn && s.fillColor && !cloud) body.fill_color = s.fillColor;
     }
     // Image stamp — send the picked image; server embeds it as a /Stamp.
     if (d.tool === 'image') {
       if (!d.imageData) return null;
       body.image = d.imageData;
     }
+    if (d.tool === 'stamp') body.stamp = Object.assign({}, d.stamp);
   }
   return body;
 }
@@ -5340,7 +6239,12 @@ function _copyLiveDraft() {
   // A copy is a new item: it starts its own history, and does not bring the
   // original's discussion with it (a lifted draft carries both).
   delete body.replies; delete body.created;
-  const g = body.rect || body.line;
+  let g = body.rect || body.line;
+  if (!g) {                                   // vertex shapes and ink: their points' bbox
+    const fl = body.vertices || [].concat(...(body.ink || []));
+    const xs = fl.filter((_, i) => i % 2 === 0), ys = fl.filter((_, i) => i % 2 === 1);
+    g = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+  }
   _annotClipboard = { items: [body], bbox: {
     x1: Math.min(g[0], g[2]), y1: Math.min(g[1], g[3]),
     x2: Math.max(g[0], g[2]), y2: Math.max(g[1], g[3]) } };
@@ -6055,7 +6959,12 @@ async function _onViewerMouseUp(e) {
   } else if (drag.tool === 'pointer' && _dragPageId) {
     const sx = Math.min(drag.startX, drag.currX), sy = Math.min(drag.startY, drag.currY);
     const sw = Math.abs(drag.currX - drag.startX), sh = Math.abs(drag.currY - drag.startY);
-    if (sw > 5 && sh > 5) {
+    const tmPress = _tmPending; _tmPending = null;
+    if (tmPress && (sw <= 5 || sh <= 5)) {
+      // A click on a highlight/underline: select it.
+      clearAllSelectionOverlays();
+      _tmShowForMarkup(tmPress.info, tmPress.page_id);
+    } else if (sw > 5 && sh > 5) {
       // Auto-detect: a marquee fully enclosing annotations selects those for
       // copy/paste; otherwise it is a plain text selection as before.
       const hits = _annotsFullyInRect(_dragPageId, sx, sy, sw, sh);
@@ -6069,6 +6978,7 @@ async function _onViewerMouseUp(e) {
 
 // ── Selection overlay (per-page) ──────────────────────────────────────────────
 function clearAllSelectionOverlays() {
+  if (_tmSel && _tmSel.mode === 'selection') _tmHide();
   _selectedChars  = [];
   _selectedPageId = null;
   _areaSelection  = null;
@@ -6162,11 +7072,26 @@ function _drawAreaSelectionRings(page_id) {
 // points). Returns null for items that cannot be replayed (empty text, unknown
 // tool) — mirrors commitDraft's own skips.
 function _annotInfoToAddBody(info) {
-  const subtypeMap = { text:'FreeText', rect:'Square', ellipse:'Circle',
+  const subtypeMap = { text:'FreeText', callout:'FreeText', rect:'Square', ellipse:'Circle',
                        line:'Line', arrow:'Line', darrow:'Line', cloud:'Polygon',
-                       highlight:'Highlight', image:'Stamp' };
+                       highlight:'Highlight', image:'Stamp', stamp:'Stamp',
+                       polygon:'Polygon', pen:'Ink' };
   const subtype = subtypeMap[info.tool];
   if (!subtype) return null;
+  if (info.tool === 'stamp' && !(info.stamp && info.stamp.label)) return null;
+  if (info.tool === 'polygon') {
+    return Object.assign({ subtype: info.closed ? 'Polygon' : 'PolyLine',
+      vertices: info.vertices.slice(), border_color: info.border_color,
+      border_width: (info.border_width != null ? info.border_width : 1),
+      border_style: info.border_style || 'solid', line_ends: info.line_ends },
+      info.fill_color && info.closed ? { fill_color: info.fill_color } : {},
+      info.author ? { author: info.author } : {});
+  }
+  if (info.tool === 'pen') {
+    return Object.assign({ subtype: 'Ink', ink: info.strokes.map(st => st.slice()),
+      border_color: info.border_color, border_width: (info.border_width != null ? info.border_width : 1),
+      highlighter: !!info.highlighter }, info.author ? { author: info.author } : {});
+  }
   const body = { subtype,
                  border_color: info.border_color,
                  border_width: (info.border_width != null ? info.border_width : 1) };
@@ -6181,13 +7106,27 @@ function _annotInfoToAddBody(info) {
     body.font       = info.font || 'Helvetica';
     body.border_width = info.border_width || 0;   // 0 = no border box
     body.is_comment = false;
+  } else if (info.tool === 'callout') {
+    const text = (info.text || '').trim();
+    if (!text || !info.tip) return null;
+    body.rect        = info.rect.slice();
+    body.callout_tip = info.tip.slice();
+    body.text        = text;
+    body.text_color  = info.text_color || [0, 0, 0];
+    body.font_size   = info.font_size || 11;
+    body.font        = info.font || 'Helvetica';
+    body.is_comment  = false;
   } else if (_isLineTool(info.tool)) {
     body.line  = info.line.slice();
-    body.arrow       = (info.tool === 'arrow' || info.tool === 'darrow');
-    body.arrow_start = (info.tool === 'darrow');
+    body.line_ends   = info.line_ends ? info.line_ends.slice()
+                     : [info.tool === 'darrow' ? 'open' : 'none',
+                        (info.tool === 'arrow' || info.tool === 'darrow') ? 'open' : 'none'];
+    body.arrow       = body.line_ends[1] !== 'none';
+    body.arrow_start = body.line_ends[0] !== 'none';
     body.border_style = info.border_style || 'solid';
   } else {
     body.rect = info.rect.slice();
+    if (info.tool === 'stamp') body.stamp = Object.assign({}, info.stamp);
     if (info.tool === 'rect' || info.tool === 'ellipse') {
       body.border_style = info.border_style || 'solid';
       if (info.fill_color) body.fill_color = info.fill_color;
@@ -6268,7 +7207,11 @@ function _pasteAnnotClipboard() {
   const bodies = _annotClipboard.items.map((it, i) => {
     const b = JSON.parse(JSON.stringify(it));
     const g = b.rect || b.line;
-    g[0] += dx; g[2] += dx; g[1] += dy; g[3] += dy;
+    if (g) { g[0] += dx; g[2] += dx; g[1] += dy; g[3] += dy; }
+    const shift = (fl) => { for (let k = 0; k + 1 < fl.length; k += 2) { fl[k] += dx; fl[k + 1] += dy; } };
+    if (b.vertices) shift(b.vertices);
+    if (b.ink) b.ink.forEach(shift);
+    if (b.callout_tip) { b.callout_tip[0] += dx; b.callout_tip[1] += dy; }
     b.session_id = SESSION_ID;
     b.page_id    = page_id;
     // One undo step for the whole paste: only the first add snapshots (same
@@ -6337,7 +7280,251 @@ function drawSelectionHighlights(chars, page_id) {
   });
 }
 
+// ── Text markup: highlight / underline / strikethrough / squiggly (v3.5) ─────
+// Select text (a marquee in Pointer mode) and a small pop-up offers the four
+// marks.  Each is ONE annotation with one quad per selected line — the
+// standard /QuadPoints shape — written by add_annotation with `quads`.
+// Clicking an existing text markup selects it (dashed ring) and the same
+// pop-up recolours it, changes its kind or deletes it, in place
+// (/api/viewer/restyle_text_markup).  It is never lifted into a movable box:
+// moving a highlight off its words makes no sense.  The box Highlight tool on
+// the Comment tab is unchanged — it is what a scanned page with no text needs.
+//
+// Coordinates: the selection's chars and the server's quads are both in the
+// viewer DISPLAY frame, PDF points, y up.  Every write goes through
+// _queueAnnotOp like every other annotation mutation.
+// (State — _tmSel, _tmPending, _tmLastColor — is declared with the other
+// annotation state near the top: reset/zoom/selection code reads it at load.)
+
+// Line boxes for a selection: each line split at column gaps, so a two-column
+// selection does not paint the gutter between the columns.
+function _tmQuadsFromLines(lines) {
+  const quads = [];
+  (lines || []).forEach(l => {
+    _splitIntoColumnGroups(l.chars).forEach(g => {
+      if (!g.chars.length) return;
+      let y1 = Infinity, y2 = -Infinity;
+      g.chars.forEach(c => { y1 = Math.min(y1, c.y); y2 = Math.max(y2, c.y + c.h); });
+      if (g.maxX > g.minX && y2 > y1) quads.push([g.minX, y1, g.maxX, y2]);
+    });
+  });
+  return quads;
+}
+
+// Client-pixel position of a display-frame point (PDF y-up).
+function _tmClientPoint(page_id, x, y) {
+  const st = _pageBlocks.get(page_id);
+  if (!st || !st.canvas || !st.pageW) return null;
+  const r = st.canvas.getBoundingClientRect();
+  const k = r.width / st.pageW;
+  return { x: r.left + x * k, y: r.top + (st.pageH - y) * k };
+}
+
+// Under the LOWEST line, at its right-hand end; above the top line when there
+// is no room below.  Fixed position, so it is put away on scroll and zoom.
+function _tmPlace(page_id, quads) {
+  const pop = document.getElementById('tm-popup');
+  if (!pop || !quads.length) return;
+  const low = quads.reduce((a, q) => (q[1] < a[1] ? q : a), quads[0]);
+  const top = quads.reduce((a, q) => (q[3] > a[3] ? q : a), quads[0]);
+  const below = _tmClientPoint(page_id, low[2], low[1]);
+  const above = _tmClientPoint(page_id, top[2], top[3]);
+  if (!below || !above) return;
+  pop.classList.add('show');
+  const w = pop.offsetWidth || 150, h = pop.offsetHeight || 40;
+  let y = below.y + 8;
+  if (y + h > window.innerHeight - 8) y = above.y - h - 8;
+  pop.style.left = Math.max(8, Math.min(below.x - w, window.innerWidth - w - 8)) + 'px';
+  pop.style.top  = Math.max(8, y) + 'px';
+}
+
+function _tmSetActiveKind(kind) {
+  document.querySelectorAll('#tm-popup .tm-btn[data-kind]').forEach(b =>
+    b.classList.toggle('active', !!kind && b.dataset.kind === kind));
+}
+
+function _tmShowForSelection(page_id, lines) {
+  if (IS_RESTRICTED || _activeAnnotTool || _draft) return;
+  const quads = _tmQuadsFromLines(lines);
+  if (!quads.length) return;
+  _tmClearRing();
+  _tmSel = { mode: 'selection', page_id, quads,
+             text: (lines || []).map(l => _charsToText(l.chars)).join('\n').trim() };
+  const pop = document.getElementById('tm-popup');
+  if (pop) pop.classList.remove('editing');
+  _tmSetActiveKind(null);
+  _tmPlace(page_id, quads);
+}
+
+function _tmShowForMarkup(info, page_id) {
+  if (!info || !info.quads || !info.quads.length) return;
+  clearAllSelectionOverlays();
+  _tmSel = { mode: 'markup', page_id, info };
+  const pop = document.getElementById('tm-popup');
+  if (pop) pop.classList.toggle('editing', !IS_RESTRICTED);
+  _tmSetActiveKind(info.markup_kind);
+  _tmDrawRing();
+  _tmPlace(page_id, info.quads);
+}
+
+function _tmClearRing() {
+  document.querySelectorAll('.tm-ring').forEach(el => el.remove());
+}
+
+// Dashed ring round each quad of the selected markup, on the page's edit
+// overlay (redrawn by drawEditableHitAreas after any re-render).
+function _tmDrawRing() {
+  _tmClearRing();
+  if (!_tmSel || _tmSel.mode !== 'markup') return;
+  const st = _pageBlocks.get(_tmSel.page_id);
+  if (!st || !st.editOv || !st.rendered) return;
+  const scale = st.renderScale * zoomLevel, pageH = st.pageH;
+  _tmSel.info.quads.forEach(q => {
+    const el = document.createElementNS(NS_SVG, 'rect');
+    el.setAttribute('class', 'tm-ring');
+    el.setAttribute('x', q[0] * scale - 2);
+    el.setAttribute('y', (pageH - q[3]) * scale - 2);
+    el.setAttribute('width',  (q[2] - q[0]) * scale + 4);
+    el.setAttribute('height', (q[3] - q[1]) * scale + 4);
+    st.editOv.appendChild(el);
+  });
+}
+
+function _tmHide() {
+  _tmSel = null;
+  _tmClearRing();
+  const pop = document.getElementById('tm-popup');
+  if (pop) pop.classList.remove('show', 'editing');
+}
+
+// Apply a write's response the way every other annotation write does.
+function _tmApply(page_id, data) {
+  if (data.error) throw apiErr(data);
+  if (typeof pwSetDocDirty === 'function') pwSetDocDirty(true);
+  vRefreshHistory(data);
+  if (data.editable) _editableAnnots[page_id] = data.editable;
+  allAnnotations[page_id] = data.annotations || [];
+  if (page_id === currentPageId) pageAnnotations = allAnnotations[page_id];
+  drawPageAnnotations(page_id);
+  _invalidateViewerPage(page_id);
+  if (data.thumbnail) {
+    const pg = allPages.find(p => p.id === page_id);
+    if (pg) { pg.thumbnail = data.thumbnail; renderThumbList(); }
+  }
+  renderComments();
+}
+
+// A kind button: mark up the selection, or change the selected markup's kind.
+function _tmKind(kind) {
+  if (!_tmSel || _blockedByRestriction()) return;
+  const sel = _tmSel;
+  if (sel.mode === 'selection') {
+    const body = { session_id: SESSION_ID, page_id: sel.page_id, subtype: kind,
+                   quads: sel.quads, text: sel.text, author: _reviewer() };
+    if (_tmLastColor[kind]) body.border_color = _tmLastColor[kind];
+    _tmHide();
+    clearAllSelectionOverlays();
+    return _queueAnnotOp(() => _vFetch('/api/viewer/add_annotation', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json()).then(data => {
+      _tmApply(sel.page_id, data);
+      showToast(window.t('toast.added_listed'), 'success');
+    })).catch(err => showToast(window.t('toast.failed') + err.message, 'error'));
+  }
+  if (kind === sel.info.markup_kind) return;
+  return _tmRestyle({ kind });
+}
+
+function _tmColor(rgb) {
+  if (!_tmSel || _tmSel.mode !== 'markup' || _blockedByRestriction()) return;
+  _tmLastColor[_tmSel.info.markup_kind] = rgb;
+  return _tmRestyle({ color: rgb });
+}
+
+function _tmRestyle(change) {
+  const { page_id, info } = _tmSel;
+  const idx = info.annot_idx;
+  return _queueAnnotOp(() => _vFetch('/api/viewer/restyle_text_markup', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ session_id: SESSION_ID, page_id, annot_idx: idx }, change)),
+  }).then(r => r.json()).then(data => {
+    _tmApply(page_id, data);
+    // Same object, same index: keep it selected so colours can be tried in turn.
+    const fresh = (data.editable || []).find(e => e.annot_idx === idx && e.tool === 'textmarkup');
+    if (fresh && _tmSel && _tmSel.mode === 'markup' && _tmSel.info.annot_idx === idx) {
+      _tmSel.info = fresh;
+      _tmSetActiveKind(fresh.markup_kind);
+    }
+  })).catch(err => showToast(window.t('toast.failed') + err.message, 'error'));
+}
+
+function _tmDelete() {
+  if (!_tmSel || _tmSel.mode !== 'markup' || _blockedByRestriction()) return;
+  const { page_id, info } = _tmSel;
+  _tmHide();
+  return _queueAnnotOp(() => _vFetch('/api/viewer/delete_annotation', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: SESSION_ID, page_id, annot_idx: info.annot_idx }),
+  }).then(r => r.json()).then(data => {
+    _tmApply(page_id, data);
+    showToast(window.t('toast.annotation_deleted'), 'success');
+  })).catch(err => showToast(window.t('toast.failed') + err.message, 'error'));
+}
+
+// Anything that moves the page under the pop-up puts it away.
+document.addEventListener('mousedown', e => {
+  if (!_tmSel) return;
+  if (e.target.closest && e.target.closest('#tm-popup')) return;
+  if (e.target.classList && e.target.classList.contains('tm-hit')) return;
+  _tmHide();
+}, true);
+document.addEventListener('keydown', e => {
+  if (!_tmSel) return;
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+  if (e.key === 'Escape') { e.preventDefault(); _tmHide(); clearAllSelectionOverlays(); }
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && _tmSel.mode === 'markup') {
+    e.preventDefault(); _tmDelete();
+  }
+});
+(function _tmHideOnScroll() {
+  const hook = () => {
+    const area = document.getElementById('canvas-area');
+    if (area) area.addEventListener('scroll', () => { if (_tmSel) _tmHide(); }, { passive: true });
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', hook);
+  else hook();
+})();
+
 // ── Text selection logic ──────────────────────────────────────────────────────
+
+// Group characters into lines using vertical-overlap detection, top line
+// first, each line's chars left to right.  Midpoint-based grouping misplaces
+// descenders (y, g, p, q) onto a separate line because their bounding box
+// extends below the baseline, shifting the midpoint down.  Overlap correctly
+// groups any character whose y-range intersects the running line range,
+// regardless of descender depth.  Shared by copy and text markup.
+function _groupCharsIntoLines(chars) {
+  const lines = [];
+  chars.forEach(ch => {
+    let bestLine = null, bestOverlap = 0;
+    lines.forEach(l => {
+      const ov = Math.min(ch.y + ch.h, l.maxY) - Math.max(ch.y, l.minY);
+      if (ov > bestOverlap) { bestOverlap = ov; bestLine = l; }
+    });
+    if (bestLine) {
+      bestLine.minY = Math.min(bestLine.minY, ch.y);
+      bestLine.maxY = Math.max(bestLine.maxY, ch.y + ch.h);
+      bestLine.chars.push(ch);
+    } else {
+      lines.push({ minY: ch.y, maxY: ch.y + ch.h, chars: [ch] });
+    }
+  });
+  lines.sort((a, b) => b.maxY - a.maxY);   // higher maxY = higher on page (PDF y increases upward)
+  lines.forEach(l => l.chars.sort((a, b) => a.x - b.x));
+  return lines;
+}
 
 // Reconstruct text from a sorted char array, inserting spaces at word gaps.
 // (Extracted from the old inline closure so both the normal and table paths share it.)
@@ -6614,28 +7801,7 @@ async function _selectTextInRect(page_id, sx, sy, sw, sh) {
     return;
   }
 
-  // Group characters into lines using vertical-overlap detection.
-  // Midpoint-based grouping misplaces descenders (y, g, p, q) onto a separate
-  // line because their bounding box extends below the baseline, shifting the
-  // midpoint down.  Overlap correctly groups any character whose y-range
-  // intersects the running line range, regardless of descender depth.
-  const lines = [];
-  selected.forEach(ch => {
-    let bestLine = null, bestOverlap = 0;
-    lines.forEach(l => {
-      const ov = Math.min(ch.y + ch.h, l.maxY) - Math.max(ch.y, l.minY);
-      if (ov > bestOverlap) { bestOverlap = ov; bestLine = l; }
-    });
-    if (bestLine) {
-      bestLine.minY = Math.min(bestLine.minY, ch.y);
-      bestLine.maxY = Math.max(bestLine.maxY, ch.y + ch.h);
-      bestLine.chars.push(ch);
-    } else {
-      lines.push({ minY: ch.y, maxY: ch.y + ch.h, chars: [ch] });
-    }
-  });
-  lines.sort((a, b) => b.maxY - a.maxY);   // higher maxY = higher on page (PDF y increases upward)
-  lines.forEach(l => l.chars.sort((a, b) => a.x - b.x));
+  const lines = _groupCharsIntoLines(selected);
 
   const text = lines.map(l => _charsToText(l.chars)).join('\n').trim();
 
@@ -6648,6 +7814,7 @@ async function _selectTextInRect(page_id, sx, sy, sw, sh) {
     showToast(window.t('toast.no_text_in_selection'), 'error');
     return;
   }
+  _tmShowForSelection(page_id, lines);
 
   // ── Table detection ───────────────────────────────────────────────────────
   const { isTable, rows } = _detectTable(lines);
@@ -9244,6 +10411,8 @@ window.addEventListener('load', () => {
         SESSION_ID    = _tabs[_activeTabIdx].session_id;
         currentPageId = _tabs[_activeTabIdx].page_id || '';
         zoomLevel     = _tabs[_activeTabIdx].zoomLevel || 1.0;
+        _zoomMode     = _tabs[_activeTabIdx].zoomMode
+                        || (_tabs[_activeTabIdx].zoomLevel ? 'custom' : 'fit');
         _fitWidthPending = !_tabs[_activeTabIdx].zoomLevel;
         _pendingScrollAnchor = _tabs[_activeTabIdx].scroll || null;
         const zl = document.getElementById('zoom-label');

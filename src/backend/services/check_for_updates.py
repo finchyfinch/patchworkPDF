@@ -246,7 +246,8 @@ def _load_current_version() -> str | None:
     # frozen: version.json sits next to the exe; dev: climb from
     # <root>/src/backend/services/check_for_updates.py to the project <root>.
     if getattr(sys, "frozen", False):
-        here = os.path.dirname(sys.executable)
+        from platform_io import platform_paths
+        here = platform_paths.frozen_data_dir()
     else:
         here = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))))

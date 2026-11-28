@@ -86,6 +86,7 @@ import os
 import sys
 import io
 import base64
+import math
 import re as _re
 import uuid
 import logging
@@ -145,7 +146,8 @@ _SCANNED_CHAR_THRESHOLD = 5
 
 def _get_base_dir():
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        from platform_io import platform_paths
+        return platform_paths.frozen_data_dir()
     # dev: this file is <root>/src/backend/routes/viewer.py — climb to <root>.
     return os.path.dirname(os.path.dirname(os.path.dirname(
         os.path.dirname(os.path.abspath(__file__)))))
@@ -598,6 +600,21 @@ _LISTED_MARKUP = ('/Square', '/Circle', '/Polygon', '/PolyLine', '/Line',
                   '/Ink', '/Caret')
 
 
+def _is_callout(ann):
+    """A FreeText callout: a text box with a leader line (/IT /FreeTextCallout)."""
+    return (str(ann.get('/Subtype', '')) == '/FreeText'
+            and str(ann.get('/IT', '')) == '/FreeTextCallout')
+
+
+def _freetext_is_markup(ann):
+    """FreeText that is page markup (listed, no popup, NO comment index)
+    rather than a comment: the Text tool's (/PWKind /Markup) and every callout
+    -- ours or another producer's.  A callout taking the comment path would have
+    its appearance regenerated as a plain box and lose its leader line.  All
+    three index-basis sites use this, so they cannot disagree."""
+    return (str(ann.get('/PWKind', '')) == '/Markup') or _is_callout(ann)
+
+
 def _line_kind(ann):
     """'line' | 'arrow' | 'darrow' for a /Line annotation, from its /LE."""
     le = ann.get('/LE')
@@ -816,9 +833,8 @@ def _get_annotations(pdf_bytes):
                     # comment: it is listed, but has no popup and no comment
                     # index.  Comments (sticky notes, the Add-comment box, and
                     # FreeText from other producers) have no marker.
-                    markup = (subtype == '/FreeText' and
-                              str(ann.get('/PWKind', '')) == '/Markup')
-                elif subtype in _LISTED_MARKUP:
+                    markup = (subtype == '/FreeText' and _freetext_is_markup(ann))
+                elif subtype in _LISTED_MARKUP or _listed_stamp(ann):
                     markup = True
                 else:
                     continue
@@ -863,6 +879,18 @@ def _get_annotations(pdf_bytes):
                 }
                 if subtype == '/Line':
                     entry['kind'] = _line_kind(ann)
+                if _is_callout(ann):
+                    entry['kind'] = 'callout'
+                if subtype == '/Polygon':
+                    entry['kind'] = ('cloud' if str(ann.get('/IT', '')) == '/PolygonCloud'
+                                     else 'polygon')
+                if subtype == '/Ink' and str(ann.get('/PWKind', '')) == '/Highlighter':
+                    entry['kind'] = 'highlighter'
+                if subtype == '/Stamp':
+                    entry['kind'] = 'stamp'
+                    if not entry['text']:
+                        nm = str(ann.get('/Name', '') or '').lstrip('/')
+                        entry['text'] = nm
                 result.append(entry)
                 if not markup:
                     editable_idx += 1
@@ -1093,36 +1121,73 @@ def _annot_edit_info(ann, idx):
         size, tcolor = _parse_da_style(da)
         fm = _re.search(r'/(\S+)\s+[\d.]+\s+Tf', da)
         font = fm.group(1) if fm else 'Helvetica'
+        if _is_callout(ann):
+            box, tip = _callout_geometry_raw(ann)
+            if box is not None and tip is not None:
+                base.update({'tool': 'callout', 'rect': box, 'tip': list(tip),
+                             'text_color': tcolor, 'font_size': size,
+                             'font': font, 'is_comment': False})
+                return base
         base.update({'tool': 'text', 'rect': rv, 'text_color': tcolor,
                      'font_size': size, 'font': font,
-                     'is_comment': str(ann.get('/PWKind', '')) != '/Markup'})
+                     'is_comment': not _freetext_is_markup(ann)})
         return base
     if subtype in ('/Square', '/Circle'):
         base.update({'tool': 'rect' if subtype == '/Square' else 'ellipse',
                      'rect': _pwrect() or rv})
         return base
-    if subtype == '/Polygon':
-        base.update({'tool': 'cloud', 'rect': _pwrect() or rv})
+    if subtype in ('/Polygon', '/PolyLine'):
+        cloudy = (str(ann.get('/IT', '')) == '/PolygonCloud')
+        if subtype == '/Polygon' and (_pwrect() is not None or ann.get('/Vertices') is None):
+            # The rectangle cloud: a Rectangle in Cloud style.
+            base.update({'tool': 'rect', 'rect': _pwrect() or rv,
+                         'border_style': 'cloud', 'fill_color': None})
+            return base
+        verts = ann.get('/Vertices')
+        if hasattr(verts, 'get_object'): verts = verts.get_object()
+        flat = _clean_points(verts, _SHAPE_MAX_POINTS)
+        if len(flat) < 4:
+            return None
+        base.update({'tool': 'polygon', 'closed': subtype == '/Polygon',
+                     'vertices': flat, 'rect': rv,
+                     'line_ends': _line_end_names(ann.get('/LE')),
+                     'border_style': 'cloud' if cloudy else base['border_style']})
+        return base
+    if subtype == '/Ink':
+        il = ann.get('/InkList')
+        if hasattr(il, 'get_object'): il = il.get_object()
+        strokes = []
+        for st in (il or []):
+            if hasattr(st, 'get_object'): st = st.get_object()
+            f = _clean_points(st, _SHAPE_MAX_POINTS)
+            if f:
+                strokes.append(f)
+        if not strokes:
+            return None
+        ca = ann.get('/CA')
+        try:    ca = float(ca) if ca is not None else 1.0
+        except Exception: ca = 1.0
+        base.update({'tool': 'pen', 'strokes': strokes, 'rect': rv,
+                     'highlighter': str(ann.get('/PWKind', '')) == '/Highlighter' or ca < 0.9})
         return base
     if subtype == '/Line':
+        # v3.5: ONE Line tool with a style per end.  Before, a start-only arrow
+        # had its endpoints FLIPPED to lift as the end-headed Arrow tool; with
+        # per-end styles that is unnecessary and would scramble the ends.
         L = ann.get('/L')
         if hasattr(L, 'get_object'): L = L.get_object()
         try: line = [float(v) for v in L][:4]
         except Exception: line = None
-        le = ann.get('/LE')
-        if hasattr(le, 'get_object'): le = le.get_object()
-        le = list(le or [])
-        head_start = len(le) > 0 and 'Arrow' in str(le[0])
-        head_end   = len(le) > 1 and 'Arrow' in str(le[1])
-        # A start-only arrowhead has no tool of its own, so flip the endpoints
-        # and lift it as a normal end-headed arrow rather than dropping the head.
-        if head_start and not head_end and line and len(line) >= 4:
-            line = [line[2], line[3], line[0], line[1]]
-            head_start, head_end = False, True
-        tool = ('darrow' if (head_start and head_end)
-                else 'arrow' if head_end else 'line')
-        base.update({'tool': tool, 'line': line,
-                     'arrow': head_end, 'arrow_start': head_start})
+        ends = _line_end_names(ann.get('/LE'))
+        base.update({'tool': 'line', 'line': line, 'line_ends': ends,
+                     'arrow': ends[1] != 'none', 'arrow_start': ends[0] != 'none'})
+        return base
+    if _is_text_markup(ann):
+        kind = subtype.lstrip('/')
+        base.update({'tool': 'textmarkup', 'markup_kind': kind, 'rect': rv,
+                     'quads': _quads_from_annot(ann),
+                     'border_color': border_color
+                                     or _TEXT_MARKUP_DEFAULT_RGB.get(kind)})
         return base
     if subtype == '/Highlight':
         base.update({'tool': 'highlight', 'rect': rv,
@@ -1130,6 +1195,13 @@ def _annot_edit_info(ann, idx):
         return base
     if subtype == '/Text':
         base.update({'tool': 'sticky', 'rect': rv})
+        return base
+    if _is_review_stamp(ann):
+        base.update({'tool': 'stamp', 'rect': rv, 'stamp': {
+            'key':   str(ann.get('/PWStampKey', '') or 'custom'),
+            'label': str(ann.get('/PWStampLabel', '') or ''),
+            'sub':   str(ann.get('/PWStampSub', '') or ''),
+            'color': border_color or [0.12, 0.55, 0.23]}})
         return base
     if subtype == '/Stamp':
         # Geometry only — the image bytes are fetched on demand at lift time
@@ -1177,6 +1249,22 @@ def _get_editable_annotations(pdf_bytes):
                     # NB: not `if rotate` — a cropped page needs the translation
                     # even when it is not rotated.  The transforms are a no-op
                     # when there is nothing to do.
+                    if rotate or off_x or off_y:
+                        if info.get('vertices') is not None:
+                            info['vertices'] = _xform_pdf_points(
+                                info['vertices'], _raw_rect_to_display,
+                                rotate, raw_W, raw_H, off_x, off_y)
+                        if info.get('strokes') is not None:
+                            info['strokes'] = [_xform_pdf_points(
+                                st, _raw_rect_to_display, rotate, raw_W, raw_H,
+                                off_x, off_y) for st in info['strokes']]
+                    if info.get('tip') is not None and (rotate or off_x or off_y):
+                        info['tip'] = _xform_pdf_points(
+                            info['tip'], _raw_rect_to_display,
+                            rotate, raw_W, raw_H, off_x, off_y)
+                    if info.get('quads') is not None:
+                        info['quads'] = _raw_quads_to_display(
+                            info['quads'], rotate, raw_W, raw_H, off_x, off_y)
                     if rotate or off_x or off_y:
                         if info.get('rect') is not None:
                             info['rect'] = _xform_pdf_rect(
@@ -1607,30 +1695,11 @@ def _ap_upright_matrix(rotate):
     return None
 
 
-def _generate_freetext_ap(ann_obj, text, rect_vals, writer, layout_wh=None,
-                          ap_matrix=None):
-    """Build and attach an /AP /N appearance XObject for a FreeText annotation.
-
-    Reads font/size from /DA, background from /IC, border from /C so the
-    regenerated appearance matches the annotation's declared style.
-
-    layout_wh/ap_matrix: on a rotated page the text is laid out upright in the
-    display-frame box dims (layout_wh) and rotated into raw space by ap_matrix,
-    so it renders upright after /Rotate.  Omit both for unrotated pages.
-    """
+def _freetext_content(ann_obj, text, bw, bh):
+    """Content-stream ops for a FreeText box of bw x bh (origin bottom-left):
+    background (/IC), border (/C, /BS /W) and word-wrapped text (/DA).
+    Returns (ops, font_name).  Shared by plain text boxes and callouts."""
     import re
-    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
-                               FloatObject, DecodedStreamObject)
-
-    rx1, ry1, rx2, ry2 = rect_vals
-    if layout_wh:
-        bw, bh = layout_wh                       # author upright in display dims
-    else:
-        bw = rx2 - rx1
-        bh = ry2 - ry1
-    if bw <= 0 or bh <= 0:
-        return
-
     # ── Parse /DA for font name, size, text-colour operators ──────────────
     da = str(ann_obj.get('/DA', '') or '/Helvetica 11 Tf 0 g')
     font_name  = 'Helvetica'
@@ -1717,6 +1786,35 @@ def _generate_freetext_ap(ann_obj, text, rect_vals, writer, layout_wh=None,
         ops.append(f'({_esc(ln)}) Tj' if i == 0 else f'T* ({_esc(ln)}) Tj')
     ops += ['ET', 'Q']
 
+    return ops, font_name
+
+
+def _generate_freetext_ap(ann_obj, text, rect_vals, writer, layout_wh=None,
+                          ap_matrix=None):
+    """Build and attach an /AP /N appearance XObject for a FreeText annotation.
+
+    Reads font/size from /DA, background from /IC, border from /C so the
+    regenerated appearance matches the annotation's declared style.
+
+    layout_wh/ap_matrix: on a rotated page the text is laid out upright in the
+    display-frame box dims (layout_wh) and rotated into raw space by ap_matrix,
+    so it renders upright after /Rotate.  Omit both for unrotated pages.
+    """
+    import re
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, DecodedStreamObject)
+
+    rx1, ry1, rx2, ry2 = rect_vals
+    if layout_wh:
+        bw, bh = layout_wh                       # author upright in display dims
+    else:
+        bw = rx2 - rx1
+        bh = ry2 - ry1
+    if bw <= 0 or bh <= 0:
+        return
+
+    ops, font_name = _freetext_content(ann_obj, text, bw, bh)
+
     stream_bytes = '\n'.join(ops).encode('latin-1', errors='replace')
 
     # ── Build XObject ──────────────────────────────────────────────────────
@@ -1741,6 +1839,270 @@ def _generate_freetext_ap(ann_obj, text, rect_vals, writer, layout_wh=None,
     ap_ref  = writer._add_object(xobj)
     ap_dict = DictionaryObject({NameObject('/N'): ap_ref})
     ann_obj[NameObject('/AP')] = writer._add_object(ap_dict)
+
+
+# ── Callout: a text box with a leader line (v3.5) ───────────────────────────
+# Written as the standard FreeText callout (/IT /FreeTextCallout, /CL leader
+# points tip -> knee -> end, /LE arrow at the tip, /RD the box inside /Rect),
+# so Acrobat reads it as a callout and Acrobat's callouts lift here.  The
+# leader is decided from the box and the tip alone (_callout_leader); the
+# client mirrors the same rule (_calloutLeader) so the preview is the result.
+_CALLOUT_KNEE_PT = 12.0
+
+
+def _callout_leader(box, tip):
+    """Display-frame box [x1,y1,x2,y2] (PDF y-up) and tip (x,y) -> (end, knee).
+    The leader leaves the middle of the box side facing the tip: left/right
+    when the tip is beside the box, else top/bottom; the knee stands
+    _CALLOUT_KNEE_PT out from that side, so the last stretch is square to it."""
+    x1, y1, x2, y2 = box
+    tx, ty = tip
+    xm, ym = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    k = _CALLOUT_KNEE_PT
+    if tx < x1:
+        return (x1, ym), (x1 - k, ym)
+    if tx > x2:
+        return (x2, ym), (x2 + k, ym)
+    if ty > y2:
+        return (xm, y2), (xm, y2 + k)
+    return (xm, y1), (xm, y1 - k)
+
+
+def _callout_arrow_ops(tip, knee, head):
+    """Open arrowhead at *tip*, pointing away from *knee* (two strokes)."""
+    tx, ty = tip
+    ang = math.atan2(ty - knee[1], tx - knee[0])
+    spread = math.radians(28)
+    out = []
+    for sgn in (1, -1):
+        hx = tx - head * math.cos(ang + sgn * spread)
+        hy = ty - head * math.sin(ang + sgn * spread)
+        out.append(f'{tx:.3f} {ty:.3f} m {hx:.3f} {hy:.3f} l S')
+    return out
+
+
+def _generate_callout_ap(ann_obj, text, box_d, tip_d, writer, rotate=0):
+    """Attach a callout appearance and return the DISPLAY-frame union box
+    [x1,y1,x2,y2] it covers (box + leader + arrowhead).
+
+    Everything is authored upright in display coordinates relative to that
+    union box; on a rotated page the form's /Matrix counter-rotates it (the
+    same mechanism as a rotated text box), so the PDF spec's BBox->Rect fit
+    lands it exactly on the raw /Rect the caller derives from the union."""
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, DecodedStreamObject)
+    bx1, by1, bx2, by2 = box_d
+    bw, bh = bx2 - bx1, by2 - by1
+    end, knee = _callout_leader(box_d, tip_d)
+
+    bs = ann_obj.get('/BS')
+    if hasattr(bs, 'get_object'): bs = bs.get_object()
+    try:    lw = float(bs.get('/W', 1.0)) if bs is not None else 1.0
+    except Exception: lw = 1.0
+    lw = max(0.5, lw)                       # the leader is always drawn
+    col = _read_color_arr(ann_obj.get('/C')) or [1.0, 0.0, 0.0]
+    head = max(6.0, lw * 4.0)
+    pad = head + lw
+    ux1 = min(bx1, tip_d[0], knee[0]) - pad
+    uy1 = min(by1, tip_d[1], knee[1]) - pad
+    ux2 = max(bx2, tip_d[0], knee[0]) + pad
+    uy2 = max(by2, tip_d[1], knee[1]) + pad
+    uw, uh = ux2 - ux1, uy2 - uy1
+
+    box_ops, font_name = _freetext_content(ann_obj, text, bw, bh)
+    sh = lambda p: (p[0] - ux1, p[1] - uy1)        # union-local coords
+    t, k, e = sh(tip_d), sh(knee), sh(end)
+    ops = ['q', f'1 0 0 1 {bx1 - ux1:.3f} {by1 - uy1:.3f} cm'] + box_ops + ['Q',
+           'q', f'{col[0]:.4f} {col[1]:.4f} {col[2]:.4f} RG', f'{lw:.3f} w',
+           '1 J 1 j',
+           f'{t[0]:.3f} {t[1]:.3f} m {k[0]:.3f} {k[1]:.3f} l {e[0]:.3f} {e[1]:.3f} l S']
+    ops += _callout_arrow_ops(t, k, head) + ['Q']
+
+    xobj = DecodedStreamObject()
+    xobj.set_data('\n'.join(ops).encode('latin-1', errors='replace'))
+    xobj[NameObject('/Type')]    = NameObject('/XObject')
+    xobj[NameObject('/Subtype')] = NameObject('/Form')
+    xobj[NameObject('/BBox')]    = ArrayObject([FloatObject(0.0), FloatObject(0.0),
+                                                FloatObject(uw), FloatObject(uh)])
+    m = _ap_upright_matrix(rotate) if rotate else None
+    if m:
+        xobj[NameObject('/Matrix')] = ArrayObject([FloatObject(v) for v in m])
+    font_dict = DictionaryObject({
+        NameObject('/Type'):     NameObject('/Font'),
+        NameObject('/Subtype'):  NameObject('/Type1'),
+        NameObject('/BaseFont'): NameObject(f'/{font_name}'),
+    })
+    xobj[NameObject('/Resources')] = DictionaryObject({
+        NameObject('/Font'): DictionaryObject({
+            NameObject(f'/{font_name}'): writer._add_object(font_dict)})})
+    ann_obj[NameObject('/AP')] = writer._add_object(
+        DictionaryObject({NameObject('/N'): writer._add_object(xobj)}))
+    return [ux1, uy1, ux2, uy2], (end, knee)
+
+
+def _callout_geometry_raw(ann):
+    """(inner box [x1,y1,x2,y2], tip (x,y)) of a callout, in RAW user space:
+    the box is /Rect inset by /RD (the standard way a callout says where its
+    text box sits inside the bigger /Rect); the tip is the first /CL point."""
+    def _arr(key):
+        v = ann.get(key)
+        if hasattr(v, 'get_object'): v = v.get_object()
+        try:
+            return [float(x) for x in (v or [])]
+        except Exception:
+            return []
+    r = _arr('/Rect')
+    if len(r) < 4:
+        return None, None
+    x1, x2 = min(r[0], r[2]), max(r[0], r[2])
+    y1, y2 = min(r[1], r[3]), max(r[1], r[3])
+    rd = _arr('/RD')
+    if len(rd) >= 4:
+        x1, y1, x2, y2 = x1 + rd[0], y1 + rd[1], x2 - rd[2], y2 - rd[3]
+    cl = _arr('/CL')
+    tip = (cl[0], cl[1]) if len(cl) >= 4 else None
+    return [x1, y1, x2, y2], tip
+
+
+# ── Review stamps: APPROVED, REJECTED, ... (v3.5) ───────────────────────────
+# A /Stamp with a VECTOR appearance (rounded frame, the label in Helvetica-Bold
+# fitted to the box, an optional second line with name and date), marked
+# /PWKind /RubberStamp and carrying its text in /PWStampLabel / /PWStampSub so
+# it lifts back as an editable stamp.  The image and signature tools also write
+# /Stamp, but those are page CONTENT (never listed); a review stamp is review
+# markup, so it is listed under Comments.  /Name is set to the standard name
+# where one exists, so other viewers know what kind of stamp it is.
+_STAMP_STD_NAMES = {
+    'approved': '/Approved', 'rejected': '/NotApproved', 'draft': '/Draft',
+    'confidential': '/Confidential', 'for_information': '/ForComment',
+    'final': '/Final',
+}
+_STAMP_LABEL_MAX, _STAMP_SUB_MAX = 60, 120
+
+# Helvetica-Bold advance widths (Adobe AFM, per 1000 em) for the label.
+_HELVETICA_BOLD_W = dict(zip(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    (722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722,
+     778, 667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611)))
+_HELVETICA_BOLD_W.update(dict(zip(
+    'abcdefghijklmnopqrstuvwxyz',
+    (556, 611, 556, 611, 556, 333, 611, 611, 278, 278, 556, 278, 889, 611,
+     611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500))))
+_HELVETICA_BOLD_W.update({' ': 278, '-': 333, '.': 278, ',': 278, ':': 333,
+                          '/': 278, '&': 722, "'": 238, '!': 333, '?': 611})
+_HELVETICA_BOLD_W.update({str(d): 556 for d in range(10)})
+
+
+def _base_char(ch):
+    """'É' -> 'E': accented Latin letters take their base letter's width."""
+    import unicodedata
+    d = unicodedata.normalize('NFD', ch)
+    return d[0] if d else ch
+
+
+def _text_width(text, size, bold=False):
+    table = _HELVETICA_BOLD_W if bold else _HELVETICA_W
+    return sum(table.get(c, table.get(_base_char(c), 600)) for c in text) / 1000.0 * size
+
+
+def _winansi_literal(text):
+    """A PDF string literal for a WinAnsi (cp1252) base-14 font: escaped, and
+    any character cp1252 cannot hold shown as '?'."""
+    b = text.encode('cp1252', errors='replace')
+    out = []
+    for byte in b:
+        c = chr(byte)
+        if c in '\\()':
+            out.append('\\' + c)
+        elif byte < 32 or byte > 126:
+            out.append('\\%03o' % byte)
+        else:
+            out.append(c)
+    return '(' + ''.join(out) + ')'
+
+
+def _review_stamp_ops(label, sub, color, bw, bh):
+    """Content ops for a review stamp in a bw x bh box (origin bottom-left)."""
+    c = color
+    lw = max(1.2, min(4.0, bh * 0.05))
+    r = min(bh * 0.18, bw * 0.1, 10.0)
+    h = lw / 2.0
+    x1, y1, x2, y2 = h, h, bw - h, bh - h
+    k = 0.5523 * r                                   # Bezier circle constant
+    ops = [f'{c[0]:.4f} {c[1]:.4f} {c[2]:.4f} RG {c[0]:.4f} {c[1]:.4f} {c[2]:.4f} rg',
+           f'{lw:.3f} w',
+           f'{x1 + r:.3f} {y1:.3f} m {x2 - r:.3f} {y1:.3f} l',
+           f'{x2 - r + k:.3f} {y1:.3f} {x2:.3f} {y1 + r - k:.3f} {x2:.3f} {y1 + r:.3f} c',
+           f'{x2:.3f} {y2 - r:.3f} l',
+           f'{x2:.3f} {y2 - r + k:.3f} {x2 - r + k:.3f} {y2:.3f} {x2 - r:.3f} {y2:.3f} c',
+           f'{x1 + r:.3f} {y2:.3f} l',
+           f'{x1 + r - k:.3f} {y2:.3f} {x1:.3f} {y2 - r + k:.3f} {x1:.3f} {y2 - r:.3f} c',
+           f'{x1:.3f} {y1 + r:.3f} l',
+           f'{x1:.3f} {y1 + r - k:.3f} {x1 + r - k:.3f} {y1:.3f} {x1 + r:.3f} {y1:.3f} c',
+           'h S']
+    pad = lw + max(4.0, bh * 0.14)
+    avail = max(1.0, bw - 2 * pad)
+    w1 = _text_width(label, 1.0, bold=True) or 1.0
+    s1 = min(bh * (0.46 if sub else 0.6), avail / w1)
+    s2 = 0.0
+    if sub:
+        w2 = _text_width(sub, 1.0) or 1.0
+        s2 = min(bh * 0.2, s1 * 0.55, avail / w2)
+    gap = s1 * 0.3 if sub else 0.0
+    # Cap height ~0.72 em; centre the block (label + gap + sub) vertically.
+    block = s1 * 0.72 + (gap + s2 * 0.72 if sub else 0.0)
+    base1 = (bh + block) / 2.0 - s1 * 0.72
+    ops += ['BT', f'/HelvB {s1:.3f} Tf',
+            f'{(bw - w1 * s1) / 2.0:.3f} {base1:.3f} Td',
+            f'{_winansi_literal(label)} Tj', 'ET']
+    if sub:
+        base2 = base1 - gap - s2 * 0.72
+        ops += ['BT', f'/Helv {s2:.3f} Tf',
+                f'{(bw - _text_width(sub, s2)) / 2.0:.3f} {base2:.3f} Td',
+                f'{_winansi_literal(sub)} Tj', 'ET']
+    return ops
+
+
+def _generate_review_stamp_ap(ann_obj, label, sub, color, bw, bh, writer,
+                              ap_matrix=None):
+    """Attach the vector appearance.  On a rotated page bw/bh are the DISPLAY
+    dims and ap_matrix counter-rotates (as for image stamps)."""
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, DecodedStreamObject)
+    ops = ['q'] + _review_stamp_ops(label, sub, color, bw, bh) + ['Q']
+    xobj = DecodedStreamObject()
+    xobj.set_data('\n'.join(ops).encode('latin-1', errors='replace'))
+    xobj[NameObject('/Type')]    = NameObject('/XObject')
+    xobj[NameObject('/Subtype')] = NameObject('/Form')
+    xobj[NameObject('/BBox')]    = ArrayObject([FloatObject(0.0), FloatObject(0.0),
+                                                FloatObject(bw), FloatObject(bh)])
+    if ap_matrix:
+        xobj[NameObject('/Matrix')] = ArrayObject([FloatObject(v) for v in ap_matrix])
+
+    def _font(base):
+        return writer._add_object(DictionaryObject({
+            NameObject('/Type'): NameObject('/Font'),
+            NameObject('/Subtype'): NameObject('/Type1'),
+            NameObject('/BaseFont'): NameObject(base),
+            NameObject('/Encoding'): NameObject('/WinAnsiEncoding')}))
+    xobj[NameObject('/Resources')] = DictionaryObject({
+        NameObject('/Font'): DictionaryObject({
+            NameObject('/HelvB'): _font('/Helvetica-Bold'),
+            NameObject('/Helv'):  _font('/Helvetica')})})
+    ann_obj[NameObject('/AP')] = writer._add_object(
+        DictionaryObject({NameObject('/N'): writer._add_object(xobj)}))
+
+
+def _is_review_stamp(ann):
+    return (str(ann.get('/Subtype', '')) == '/Stamp'
+            and str(ann.get('/PWKind', '')) == '/RubberStamp')
+
+
+def _listed_stamp(ann):
+    """A /Stamp that is review markup: ours, or another producer's named stamp
+    (Acrobat's APPROVED etc.).  Image and signature stamps carry no /Name."""
+    return (str(ann.get('/Subtype', '')) == '/Stamp'
+            and (_is_review_stamp(ann) or ann.get('/Name') is not None))
 
 
 def _make_image_xobject(writer, img_bytes):
@@ -1921,6 +2283,383 @@ def _generate_highlight_ap(ann_obj, rect, color, writer):
         DictionaryObject({NameObject('/N'): ap_ref}))
 
 
+# ── Text markup on selected text (v3.5) ──────────────────────────────────────
+# Highlight / Underline / StrikeOut / Squiggly written from a TEXT SELECTION:
+# one quad per selected line (/QuadPoints, the PDF-standard shape Acrobat writes
+# and reads), not one box.  Marked /PWKind /TextMarkup so the viewer selects
+# them as text markup (recolour, change type, delete) instead of lifting them
+# into a movable box — moving a highlight off its words makes no sense.  The box
+# Highlight tool (no quads) is unchanged and still lifts as a box; it is what a
+# scanned page with no text needs.
+_TEXT_MARKUP = ('Highlight', 'Underline', 'StrikeOut', 'Squiggly')
+_TEXT_MARKUP_DEFAULT_RGB = {
+    'Highlight': [1.0, 0.92, 0.0], 'Underline': [0.0, 0.45, 0.85],
+    'StrikeOut': [0.86, 0.1, 0.1], 'Squiggly':  [0.86, 0.1, 0.1],
+}
+_TEXT_MARKUP_MAX_QUADS = 2000
+
+
+def _quads_from_annot(ann):
+    """An annotation's /QuadPoints as [[x1,y1,...,x4,y4], ...] (TL, TR, BL, BR
+    per the spec).  Falls back to the /Rect as one quad."""
+    qp = ann.get('/QuadPoints')
+    if hasattr(qp, 'get_object'):
+        qp = qp.get_object()
+    out = []
+    try:
+        vals = [float(v) for v in (qp or [])]
+        for i in range(0, len(vals) - 7, 8):
+            out.append(vals[i:i + 8])
+    except Exception:
+        out = []
+    if not out:
+        r = ann.get('/Rect')
+        if hasattr(r, 'get_object'):
+            r = r.get_object()
+        try:
+            x1, y1, x2, y2 = [float(v) for v in r][:4]
+            x1, x2 = min(x1, x2), max(x1, x2)
+            y1, y2 = min(y1, y2), max(y1, y2)
+            out = [[x1, y2, x2, y2, x1, y1, x2, y1]]
+        except Exception:
+            out = []
+    return out
+
+
+def _is_text_markup(ann):
+    """True for markup that is edited as TEXT markup rather than lifted as a
+    box: underline/strikeout/squiggly always; a highlight when we wrote it from
+    a text selection, or when it spans several quads (a foreign multi-line
+    highlight would lose its shape as a box)."""
+    sub = str(ann.get('/Subtype', ''))
+    if sub in ('/Underline', '/StrikeOut', '/Squiggly'):
+        return True
+    if sub == '/Highlight':
+        return (str(ann.get('/PWKind', '')) == '/TextMarkup'
+                or len(_quads_from_annot(ann)) > 1)
+    return False
+
+
+def _quad_frame(q):
+    """(BL, along, up, length, height) for a quad: BL corner, unit vector along
+    the text, unit vector toward its top, and the quad's extent each way.
+    Works for any orientation, so a rotated page needs nothing special."""
+    tlx, tly, trx, try_, blx, bly, brx, bry = q
+    ax, ay = brx - blx, bry - bly
+    ux, uy = tlx - blx, tly - bly
+    L = math.hypot(ax, ay) or 1.0
+    H = math.hypot(ux, uy) or 1.0
+    return (blx, bly), (ax / L, ay / L), (ux / H, uy / H), L, H
+
+
+def _text_markup_ap_ops(kind, quads, color):
+    """Content-stream ops (absolute page coords) drawing *kind* over *quads*.
+    Returns (ops, pad) — pad is how far a stroke can reach past the quads."""
+    c = color or _TEXT_MARKUP_DEFAULT_RGB.get(kind, [1.0, 0.92, 0.0])
+    ops, pad = [], 0.0
+    if kind == 'Highlight':
+        ops.append(f'/GSmul gs {c[0]:.4f} {c[1]:.4f} {c[2]:.4f} rg')
+        for q in quads:
+            tlx, tly, trx, try_, blx, bly, brx, bry = q
+            ops.append(f'{tlx:.3f} {tly:.3f} m {trx:.3f} {try_:.3f} l '
+                       f'{brx:.3f} {bry:.3f} l {blx:.3f} {bly:.3f} l h f')
+        return ops, 0.0
+    ops.append(f'{c[0]:.4f} {c[1]:.4f} {c[2]:.4f} RG 1 J 1 j')
+    for q in quads:
+        (bx, by), (ax, ay), (ux, uy), L, H = _quad_frame(q)
+        w = max(0.5, H / 14.0)
+        pad = max(pad, w + H / 8.0)
+        if kind == 'Squiggly':
+            amp, step = max(0.6, H / 14.0), max(1.5, H / 6.0)
+            base = w + amp
+            pts, t, up = [], 0.0, False
+            while t <= L + 1e-6:
+                off = base + (amp if up else -amp)
+                pts.append((bx + ax * t + ux * off, by + ay * t + uy * off))
+                t += step
+                up = not up
+            if len(pts) < 2:
+                pts = [(bx + ux * base, by + uy * base),
+                       (bx + ax * L + ux * base, by + ay * L + uy * base)]
+            seg = ' '.join(f'{x:.3f} {y:.3f} l' for x, y in pts[1:])
+            ops.append(f'{w * 0.8:.3f} w {pts[0][0]:.3f} {pts[0][1]:.3f} m {seg} S')
+            continue
+        # Underline sits just above the quad's bottom (the char boxes include
+        # descenders); strikeout through the middle of the x-height band.
+        off = w if kind == 'Underline' else H * 0.45
+        x1, y1 = bx + ux * off, by + uy * off
+        x2, y2 = x1 + ax * L, y1 + ay * L
+        ops.append(f'{w:.3f} w {x1:.3f} {y1:.3f} m {x2:.3f} {y2:.3f} l S')
+    return ops, pad
+
+
+def _generate_text_markup_ap(ann_obj, kind, quads, color, writer):
+    """Attach an /AP to a text-markup annotation and return its /Rect.  The
+    appearance is drawn in absolute page coordinates with BBox == Rect, so the
+    form maps onto the page with no transform (pdfium renders the AP; Acrobat
+    uses it too when present)."""
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, DecodedStreamObject)
+    ops, pad = _text_markup_ap_ops(kind, quads, color)
+    xs = [q[i] for q in quads for i in (0, 2, 4, 6)]
+    ys = [q[i] for q in quads for i in (1, 3, 5, 7)]
+    bbox = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+    stream = ('q ' + '\n'.join(ops) + ' Q').encode('latin-1', 'replace')
+    xobj = DecodedStreamObject(); xobj.set_data(stream)
+    xobj[NameObject('/Type')]    = NameObject('/XObject')
+    xobj[NameObject('/Subtype')] = NameObject('/Form')
+    xobj[NameObject('/BBox')]    = ArrayObject([FloatObject(v) for v in bbox])
+    if kind == 'Highlight':
+        gs = DictionaryObject({NameObject('/Type'): NameObject('/ExtGState'),
+                               NameObject('/BM'): NameObject('/Multiply')})
+        xobj[NameObject('/Resources')] = DictionaryObject({
+            NameObject('/ExtGState'): DictionaryObject({
+                NameObject('/GSmul'): writer._add_object(gs)})})
+    ann_obj[NameObject('/AP')] = writer._add_object(
+        DictionaryObject({NameObject('/N'): writer._add_object(xobj)}))
+    return bbox
+
+
+def _display_quads_to_raw(rects, rotate, raw_W, raw_H, off_x, off_y):
+    """Display-frame line boxes [[x1,y1,x2,y2], ...] (PDF y-up) → raw quads
+    [TL, TR, BL, BR] (8 floats each).  The four corners are transformed as
+    POINTS, so on a rotated page each quad keeps the text's own orientation
+    (its 'bottom' edge is still under the words) — which is what underline and
+    strikeout are drawn from."""
+    out = []
+    for r in rects[:_TEXT_MARKUP_MAX_QUADS]:
+        try:
+            x1, y1, x2, y2 = [float(v) for v in r][:4]
+        except Exception:
+            continue
+        if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+            continue
+        x1, x2 = min(x1, x2), max(x1, x2)
+        y1, y2 = min(y1, y2), max(y1, y2)
+        if x2 - x1 <= 0 or y2 - y1 <= 0:
+            continue
+        pts = [x1, y2, x2, y2, x1, y1, x2, y1]
+        if rotate or off_x or off_y:
+            pts = _xform_pdf_points(pts, _display_rect_to_raw,
+                                    rotate, raw_W, raw_H, off_x, off_y)
+        out.append([float(v) for v in pts])
+    return out
+
+
+def _raw_quads_to_display(quads, rotate, raw_W, raw_H, off_x, off_y):
+    """Raw quads → display-frame line boxes [x1,y1,x2,y2] (PDF y-up), for the
+    viewer's hit-areas and selection ring."""
+    out = []
+    for q in quads:
+        pts = q
+        if rotate or off_x or off_y:
+            pts = _xform_pdf_points(list(q), _raw_rect_to_display,
+                                    rotate, raw_W, raw_H, off_x, off_y)
+        xs, ys = pts[0::2], pts[1::2]
+        out.append([min(xs), min(ys), max(xs), max(ys)])
+    return out
+
+
+# ── Line ends, vertex shapes and ink (v3.5) ─────────────────────────────────
+# The Arrow / Dbl Arrow tools became ONE Line tool with a style per end, so
+# the six standard PDF line endings are all drawable.  Polygon and PolyLine
+# take arbitrary vertices; a cloud is a BORDER STYLE (/IT /PolygonCloud +
+# /BE /S /C, as Acrobat writes it) on a rectangle or a polygon.  Ink is the
+# Pen.  All of these are written with their appearance in absolute page
+# coordinates (BBox == Rect, no /Matrix), like text markup.
+_LINE_ENDS = {'none': '/None', 'open': '/OpenArrow', 'closed': '/ClosedArrow',
+              'circle': '/Circle', 'square': '/Square', 'slash': '/Slash'}
+_LINE_ENDS_BACK = {v: k for k, v in _LINE_ENDS.items()}
+_SHAPE_MAX_POINTS = 6000
+
+
+def _line_end_names(le):
+    """/LE (an array of two names; a single name on some producers' polylines)
+    -> ['open', 'none'] style keys.  Unknown arrow-ish names read as 'open'."""
+    if hasattr(le, 'get_object'):
+        le = le.get_object()
+    if le is None:
+        return ['none', 'none']
+    vals = [str(le)] if isinstance(le, str) else [str(v) for v in list(le)][:2]
+    while len(vals) < 2:
+        vals.insert(0, '/None')
+    return [_LINE_ENDS_BACK.get(v, 'open' if 'Arrow' in v else 'none') for v in vals]
+
+
+def _line_end_ops(kind, tip, frm, size, lw):
+    """Ops drawing line-end *kind* at *tip*, the line arriving from *frm*.
+    The current stroke colour is used; closed shapes are FILLED with it (the
+    caller has set the fill colour to match)."""
+    if kind == 'none':
+        return []
+    tx, ty = tip
+    ang = math.atan2(ty - frm[1], tx - frm[0])
+    ca, sa = math.cos(ang), math.sin(ang)
+    if kind in ('open', 'closed'):
+        spread = math.radians(28)
+        pts = [(tx - size * math.cos(ang + sg * spread),
+                ty - size * math.sin(ang + sg * spread)) for sg in (1, -1)]
+        if kind == 'open':
+            return [f'{tx:.3f} {ty:.3f} m {x:.3f} {y:.3f} l S' for x, y in pts]
+        (ax, ay), (bx, by) = pts
+        return [f'{tx:.3f} {ty:.3f} m {ax:.3f} {ay:.3f} l {bx:.3f} {by:.3f} l h B']
+    r = size * 0.35
+    if kind == 'circle':
+        k = 0.5523 * r
+        return [f'{tx + r:.3f} {ty:.3f} m',
+                f'{tx + r:.3f} {ty + k:.3f} {tx + k:.3f} {ty + r:.3f} {tx:.3f} {ty + r:.3f} c',
+                f'{tx - k:.3f} {ty + r:.3f} {tx - r:.3f} {ty + k:.3f} {tx - r:.3f} {ty:.3f} c',
+                f'{tx - r:.3f} {ty - k:.3f} {tx - k:.3f} {ty - r:.3f} {tx:.3f} {ty - r:.3f} c',
+                f'{tx + k:.3f} {ty - r:.3f} {tx + r:.3f} {ty - k:.3f} {tx + r:.3f} {ty:.3f} c', 'B']
+    if kind == 'square':
+        corners = [(-r, -r), (r, -r), (r, r), (-r, r)]
+        p = [(tx + cx * ca - cy * sa, ty + cx * sa + cy * ca) for cx, cy in corners]
+        return [f'{p[0][0]:.3f} {p[0][1]:.3f} m ' + ' '.join(
+            f'{x:.3f} {y:.3f} l' for x, y in p[1:]) + ' h B']
+    if kind == 'slash':                       # 30 deg off the perpendicular
+        a2 = ang + math.radians(60)
+        h = size * 0.5
+        return [f'{tx - h * math.cos(a2):.3f} {ty - h * math.sin(a2):.3f} m '
+                f'{tx + h * math.cos(a2):.3f} {ty + h * math.sin(a2):.3f} l S']
+    return []
+
+
+def _end_size(lw):
+    return max(8.0, lw * 3.5)
+
+
+def _cloud_polygon_ops(pts, arc):
+    """A revision cloud along a CLOSED polygon (list of (x,y)); bumps bulge
+    OUTWARD whichever way round the vertices go (sign of the shoelace area)."""
+    n = len(pts)
+    area2 = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                for i in range(n))
+    out_sign = 1.0 if area2 > 0 else -1.0     # CCW: outward is the right normal
+    segs = []
+    for i in range(n):
+        (sx, sy), (ex, ey) = pts[i], pts[(i + 1) % n]
+        L = math.hypot(ex - sx, ey - sy)
+        if L < 1e-6:
+            continue
+        k = max(1, int(round(L / (arc * 2))))
+        for j in range(k):
+            a0, a1 = j / k, (j + 1) / k
+            segs.append((sx + (ex - sx) * a0, sy + (ey - sy) * a0,
+                         sx + (ex - sx) * a1, sy + (ey - sy) * a1))
+    if not segs:
+        return []
+    out = [f'{segs[0][0]:.3f} {segs[0][1]:.3f} m']
+    for sx, sy, ex, ey in segs:
+        dl = math.hypot(ex - sx, ey - sy) or 1.0
+        tx, ty = (ex - sx) / dl, (ey - sy) / dl
+        nx, ny = ty * out_sign, -tx * out_sign
+        r = dl / 2.0
+        bulge, tang = r * 0.75, r * 0.5
+        out.append(f'{sx + tx * tang + nx * bulge:.3f} {sy + ty * tang + ny * bulge:.3f} '
+                   f'{ex - tx * tang + nx * bulge:.3f} {ey - ty * tang + ny * bulge:.3f} '
+                   f'{ex:.3f} {ey:.3f} c')
+    out.append('h')
+    return out
+
+
+def _cloud_arc_for(pts):
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    return max(6.0, min(16.0, min(max(xs) - min(xs), max(ys) - min(ys)) / 4.0 or 10.0))
+
+
+def _attach_abs_ap(ann_obj, ops, rect, writer, ext=None):
+    """Attach an appearance drawn in absolute page coords (BBox == Rect)."""
+    from pypdf.generic import (DictionaryObject, NameObject, ArrayObject,
+                               FloatObject, DecodedStreamObject)
+    xobj = DecodedStreamObject()
+    xobj.set_data(('q\n' + '\n'.join(ops) + '\nQ').encode('latin-1', 'replace'))
+    xobj[NameObject('/Type')] = NameObject('/XObject')
+    xobj[NameObject('/Subtype')] = NameObject('/Form')
+    xobj[NameObject('/BBox')] = ArrayObject([FloatObject(v) for v in rect])
+    if ext:
+        gs = DictionaryObject({NameObject('/Type'): NameObject('/ExtGState')})
+        for k, v in ext.items():
+            gs[NameObject(k)] = v
+        xobj[NameObject('/Resources')] = DictionaryObject({
+            NameObject('/ExtGState'): DictionaryObject({
+                NameObject('/GS0'): writer._add_object(gs)})})
+    ann_obj[NameObject('/AP')] = writer._add_object(
+        DictionaryObject({NameObject('/N'): writer._add_object(xobj)}))
+
+
+def _generate_vertex_shape_ap(ann_obj, closed, pts, style, writer):
+    """Polygon (closed) / PolyLine (open) appearance.  Returns the /Rect."""
+    lw = max(0.0, float(style.get('border_width', 1.0) or 0.0))
+    bc = style.get('border_color') or [1.0, 0.0, 0.0]
+    fc = style.get('fill_color') if closed else None
+    cloud = bool(style.get('cloud')) and closed
+    dashes = None if cloud else (style.get('dashes') or None)
+    ends = style.get('line_ends') or ['none', 'none']
+    arc = _cloud_arc_for(pts) if cloud else 0.0
+    es = _end_size(lw) if (not closed and any(e != 'none' for e in ends)) else 0.0
+    pad = lw / 2.0 + 1.0 + arc + es
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    rect = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+    c = bc
+    ops = [f'{c[0]:.4f} {c[1]:.4f} {c[2]:.4f} RG', f'{max(lw, 0.5):.3f} w', '1 J 1 j']
+    if fc:
+        ops.append(f'{fc[0]:.4f} {fc[1]:.4f} {fc[2]:.4f} rg')
+    if dashes:
+        ops.append('[' + ' '.join(f'{v:.3f}' for v in dashes) + '] 0 d')
+    if cloud:
+        ops += _cloud_polygon_ops(pts, arc) + ['S']
+    else:
+        path = f'{pts[0][0]:.3f} {pts[0][1]:.3f} m ' + ' '.join(
+            f'{x:.3f} {y:.3f} l' for x, y in pts[1:])
+        if closed:
+            ops.append(path + ' h ' + ('B' if (fc and lw > 0) else 'f' if fc else 'S'))
+        else:
+            ops.append(path + ' S')
+    if not closed and len(pts) >= 2 and es:
+        if dashes:
+            ops.append('[] 0 d')
+        ops.append(f'{c[0]:.4f} {c[1]:.4f} {c[2]:.4f} rg')
+        ops += _line_end_ops(ends[0], pts[0], pts[1], es, lw)
+        ops += _line_end_ops(ends[1], pts[-1], pts[-2], es, lw)
+    _attach_abs_ap(ann_obj, ops, rect, writer)
+    return rect
+
+
+def _generate_ink_ap(ann_obj, strokes, color, lw, highlighter, writer):
+    """Pen appearance: each stroke a round-capped polyline.  The highlighter is
+    wide, translucent and multiplied, so text under it stays readable."""
+    from pypdf.generic import NameObject, FloatObject
+    xs = [x for st in strokes for x in st[0::2]]
+    ys = [y for st in strokes for y in st[1::2]]
+    pad = lw / 2.0 + 1.0
+    rect = [min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad]
+    ops = []
+    if highlighter:
+        ops.append('/GS0 gs')
+    ops += [f'{color[0]:.4f} {color[1]:.4f} {color[2]:.4f} RG', f'{lw:.3f} w', '1 J 1 j']
+    for st in strokes:
+        pts = list(zip(st[0::2], st[1::2]))
+        if len(pts) == 1:
+            pts = pts + [(pts[0][0] + 0.01, pts[0][1])]   # a dot
+        ops.append(f'{pts[0][0]:.3f} {pts[0][1]:.3f} m ' + ' '.join(
+            f'{x:.3f} {y:.3f} l' for x, y in pts[1:]) + ' S')
+    ext = ({'/CA': FloatObject(0.35), '/BM': NameObject('/Multiply')}
+           if highlighter else None)
+    _attach_abs_ap(ann_obj, ops, rect, writer, ext)
+    return rect
+
+
+def _clean_points(flat, limit):
+    """Validate a flat [x,y,x,y,...] list: finite numbers, even length, capped."""
+    try:
+        v = [float(a) for a in (flat or [])][:limit * 2]
+    except Exception:
+        return []
+    if len(v) % 2:
+        v = v[:-1]
+    return v if all(math.isfinite(a) for a in v) else []
+
+
 def _generate_shape_ap(ann_obj, subtype, geom, style, writer):
     """Build and attach an /AP /N appearance for a shape annotation.
 
@@ -2021,10 +2760,18 @@ def _generate_shape_ap(ann_obj, subtype, geom, style, writer):
                 hy = tipy - ah * math.sin(ang + sgn * spread)
                 ops.append(f'{tipx:.3f} {tipy:.3f} m {hx:.3f} {hy:.3f} l S')
 
-        if style.get('arrow'):
-            _arrow_head(ax2, ay2, ax1, ay1)
-        if style.get('arrow_start'):        # double-ended arrow
-            _arrow_head(ax1, ay1, ax2, ay2)
+        ends = style.get('line_ends')
+        if ends:
+            # v3.5 line ends: the same rules as a polyline's ends.
+            col = bc if (bw_pt > 0 and bc) else [0.0, 0.0, 0.0]
+            ops.append(f'{col[0]:.4f} {col[1]:.4f} {col[2]:.4f} rg')
+            ops.extend(_line_end_ops(ends[0], (ax1, ay1), (ax2, ay2), ah, bw_pt))
+            ops.extend(_line_end_ops(ends[1], (ax2, ay2), (ax1, ay1), ah, bw_pt))
+        else:
+            if style.get('arrow'):
+                _arrow_head(ax2, ay2, ax1, ay1)
+            if style.get('arrow_start'):        # double-ended arrow
+                _arrow_head(ax1, ay1, ax2, ay2)
 
     ops.append('Q')
     stream_bytes = '\n'.join(ops).encode('latin-1', errors='replace')
@@ -3440,8 +4187,7 @@ def register_viewer_routes(app, sessions, inject_token=None):
                     continue
                 # Must match _get_annotations' index basis (it skips dumb text
                 # and replies).
-                if subtype == '/FreeText' and \
-                        str(ann_obj.get('/PWKind', '')) == '/Markup':
+                if subtype == '/FreeText' and _freetext_is_markup(ann_obj):
                     continue
                 if ann_obj.get('/IRT') is not None:
                     continue
@@ -3555,15 +4301,26 @@ def register_viewer_routes(app, sessions, inject_token=None):
         except Exception: border_width = 1.0
         # Stroke dash style (shapes/lines): 'solid' (default) | 'dashed' | 'dotted'.
         border_style = str(data.get('border_style', 'solid') or 'solid')
-        if border_style not in ('solid', 'dashed', 'dotted'):
+        if border_style not in ('solid', 'dashed', 'dotted', 'cloud'):
             border_style = 'solid'
         _dw = max(border_width, 0.5)
         dashes = ([3.0 * _dw, 3.0 * _dw] if border_style == 'dashed'
                   else [_dw, 2.0 * _dw]  if border_style == 'dotted' else None)
+        # A rectangle in Cloud style is the existing rectangle cloud.
+        if subtype == 'Square' and border_style == 'cloud':
+            subtype = 'Polygon'
+            dashes = None
         try:    font_size = max(4.0, float(data.get('font_size', 11.0)))
         except Exception: font_size = 11.0
         arrow       = bool(data.get('arrow', False))        # head at endpoint 2
         arrow_start = bool(data.get('arrow_start', False))  # head at endpoint 1
+        # v3.5: a style per end ('none','open','closed','circle','square',
+        # 'slash'); the old arrow flags still mean 'open'.
+        line_ends = data.get('line_ends')
+        if isinstance(line_ends, (list, tuple)) and len(line_ends) == 2:
+            line_ends = [str(e) if str(e) in _LINE_ENDS else 'none' for e in line_ends]
+        else:
+            line_ends = ['open' if arrow_start else 'none', 'open' if arrow else 'none']
         # FreeText drawn with the Text tool is decorative markup, not a comment.
         is_comment = bool(data.get('is_comment', True))
         # Font: restrict to the PDF base-14 families (no embedding needed).
@@ -3616,7 +4373,57 @@ def register_viewer_routes(app, sessions, inject_token=None):
             def _carr(rgb):
                 return ArrayObject([FloatObject(c) for c in rgb])
 
-            if subtype == 'FreeText':
+            if subtype == 'FreeText' and data.get('callout_tip') and disp_rect:
+                # Callout.  Geometry is decided in the DISPLAY frame (what the
+                # user drew), then the union box and the leader points are
+                # taken to raw space for /Rect, /CL and /RD.
+                try:
+                    tip_d = [float(v) for v in data.get('callout_tip')][:2]
+                    if len(tip_d) != 2 or not all(math.isfinite(v) for v in tip_d):
+                        raise ValueError
+                except Exception:
+                    return jsonify({'error': 'Bad callout point'}), 400
+                box_d = [min(disp_rect[0], disp_rect[2]), min(disp_rect[1], disp_rect[3]),
+                         max(disp_rect[0], disp_rect[2]), max(disp_rect[1], disp_rect[3])]
+                tc = text_color or [0.0, 0.0, 0.0]
+                annot = DictionaryObject({
+                    NameObject('/Type'):     NameObject('/Annot'),
+                    NameObject('/Subtype'):  NameObject('/FreeText'),
+                    NameObject('/IT'):       NameObject('/FreeTextCallout'),
+                    NameObject('/Contents'): _TS2(text),
+                    NameObject('/DA'):       _TS2(f'/{font} {font_size:.2f} Tf '
+                                                  f'{tc[0]:.4f} {tc[1]:.4f} {tc[2]:.4f} rg'),
+                    NameObject('/F'):        NumberObject(4),
+                    NameObject('/Q'):        NumberObject(0),
+                    NameObject('/C'):        _carr(border_color or [1.0, 0.0, 0.0]),
+                    NameObject('/BS'): DictionaryObject({
+                        NameObject('/W'): FloatObject(max(0.5, border_width)),
+                        NameObject('/S'): NameObject('/S')}),
+                    NameObject('/LE'):       NameObject('/OpenArrow'),
+                    NameObject('/PWKind'):   NameObject('/Markup'),
+                })
+                if fill_color:
+                    annot[NameObject('/IC')] = _carr(fill_color)
+                union_d, (end_d, knee_d) = _generate_callout_ap(
+                    annot, text, box_d, tip_d, writer, rotate)
+                to_raw_pts = lambda pts: (_xform_pdf_points(
+                    list(pts), _display_rect_to_raw, rotate, raw_W, raw_H, off_x, off_y)
+                    if (rotate or off_x or off_y) else list(pts))
+                to_raw_rect = lambda r: (_xform_pdf_rect(
+                    list(r), _display_rect_to_raw, rotate, raw_W, raw_H, off_x, off_y)
+                    if (rotate or off_x or off_y) else list(r))
+                u = to_raw_rect(union_d)
+                b = to_raw_rect(box_d)
+                u = [min(u[0], u[2]), min(u[1], u[3]), max(u[0], u[2]), max(u[1], u[3])]
+                b = [min(b[0], b[2]), min(b[1], b[3]), max(b[0], b[2]), max(b[1], b[3])]
+                annot[NameObject('/Rect')] = _carr(u)
+                annot[NameObject('/RD')] = _carr([b[0] - u[0], b[1] - u[1],
+                                                  u[2] - b[2], u[3] - b[3]])
+                annot[NameObject('/CL')] = _carr(
+                    to_raw_pts([tip_d[0], tip_d[1], knee_d[0], knee_d[1],
+                                end_d[0], end_d[1]]))
+
+            elif subtype == 'FreeText':
                 rv = [float(v) for v in rect]
                 tc = text_color or [0.0, 0.0, 0.0]
                 da_str = (f'/{font} {font_size:.2f} Tf '
@@ -3652,12 +4459,89 @@ def register_viewer_routes(app, sessions, inject_token=None):
                 else:
                     _generate_freetext_ap(annot, text, rv, writer)
 
+            elif subtype in ('Polygon', 'PolyLine') and data.get('vertices'):
+                # Vertex shapes (v3.5).  Display-frame vertices in, raw out.
+                flat = _clean_points(data.get('vertices'), _SHAPE_MAX_POINTS)
+                if rotate or off_x or off_y:
+                    flat = _xform_pdf_points(flat, _display_rect_to_raw,
+                                             rotate, raw_W, raw_H, off_x, off_y)
+                pts = list(zip(flat[0::2], flat[1::2]))
+                closed = subtype == 'Polygon'
+                if len(pts) < (3 if closed else 2):
+                    return jsonify({'error': 'Not enough points',
+                                    'error_key': 'err.not_enough_points'}), 400
+                cloud = closed and border_style == 'cloud'
+                style = {'border_color': border_color, 'fill_color': fill_color,
+                         'border_width': border_width, 'dashes': None if cloud else dashes,
+                         'cloud': cloud, 'line_ends': line_ends}
+                bs = DictionaryObject({
+                    NameObject('/W'): NumberObject(border_width),
+                    NameObject('/S'): NameObject('/D' if (dashes and not cloud) else '/S')})
+                if dashes and not cloud:
+                    bs[NameObject('/D')] = ArrayObject([FloatObject(v) for v in dashes])
+                annot = DictionaryObject({
+                    NameObject('/Type'):     NameObject('/Annot'),
+                    NameObject('/Subtype'):  NameObject('/' + subtype),
+                    NameObject('/F'):        NumberObject(4),
+                    NameObject('/BS'):       bs,
+                    NameObject('/C'):        _carr(border_color or [1.0, 0.0, 0.0]),
+                    NameObject('/Vertices'): _carr(flat),
+                })
+                if closed and fill_color:
+                    annot[NameObject('/IC')] = _carr(fill_color)
+                if cloud:
+                    annot[NameObject('/IT')] = NameObject('/PolygonCloud')
+                    annot[NameObject('/BE')] = DictionaryObject({
+                        NameObject('/S'): NameObject('/C'),
+                        NameObject('/I'): NumberObject(1)})
+                if not closed and any(e != 'none' for e in line_ends):
+                    annot[NameObject('/LE')] = ArrayObject(
+                        [NameObject(_LINE_ENDS[e]) for e in line_ends])
+                annot[NameObject('/Rect')] = _carr(
+                    _generate_vertex_shape_ap(annot, closed, pts, style, writer))
+
+            elif subtype == 'Ink':
+                strokes = []
+                budget = _SHAPE_MAX_POINTS
+                for st_in in (data.get('ink') or [])[:200]:
+                    flat = _clean_points(st_in, budget)
+                    if not flat:
+                        continue
+                    budget -= len(flat) // 2
+                    if rotate or off_x or off_y:
+                        flat = _xform_pdf_points(flat, _display_rect_to_raw,
+                                                 rotate, raw_W, raw_H, off_x, off_y)
+                    strokes.append(flat)
+                    if budget <= 0:
+                        break
+                if not strokes:
+                    return jsonify({'error': 'Nothing drawn',
+                                    'error_key': 'err.not_enough_points'}), 400
+                hl = bool(data.get('highlighter'))
+                lw = max(0.5, min(40.0, border_width))
+                col = border_color or ([1.0, 0.92, 0.0] if hl else [1.0, 0.0, 0.0])
+                annot = DictionaryObject({
+                    NameObject('/Type'):    NameObject('/Annot'),
+                    NameObject('/Subtype'): NameObject('/Ink'),
+                    NameObject('/F'):       NumberObject(4),
+                    NameObject('/C'):       _carr(col),
+                    NameObject('/BS'): DictionaryObject({
+                        NameObject('/W'): FloatObject(lw), NameObject('/S'): NameObject('/S')}),
+                    NameObject('/InkList'): ArrayObject([_carr(st) for st in strokes]),
+                })
+                if hl:
+                    annot[NameObject('/CA')] = FloatObject(0.35)
+                    annot[NameObject('/PWKind')] = NameObject('/Highlighter')
+                annot[NameObject('/Rect')] = _carr(
+                    _generate_ink_ap(annot, strokes, col, lw, hl, writer))
+
             elif subtype in ('Square', 'Circle', 'Line', 'Polygon'):
                 # Dash style applies to Square/Circle/Line (clouds stay solid).
                 use_dashes = dashes if subtype != 'Polygon' else None
                 style = {'border_color': border_color, 'fill_color': fill_color,
                          'border_width': border_width, 'arrow': arrow,
-                         'arrow_start': arrow_start, 'dashes': use_dashes}
+                         'arrow_start': arrow_start, 'dashes': use_dashes,
+                         'line_ends': line_ends if subtype == 'Line' else None}
                 geom = ([float(v) for v in line_pts] if subtype == 'Line'
                         else [float(v) for v in rect])
                 bs = DictionaryObject({
@@ -3681,15 +4565,16 @@ def register_viewer_routes(app, sessions, inject_token=None):
                 if subtype == 'Line':
                     annot[NameObject('/L')] = ArrayObject(
                         [FloatObject(v) for v in geom])
-                    if arrow or arrow_start:
-                        annot[NameObject('/LE')] = ArrayObject([
-                            NameObject('/OpenArrow' if arrow_start else '/None'),
-                            NameObject('/OpenArrow' if arrow       else '/None')])
+                    if any(e != 'none' for e in line_ends):
+                        annot[NameObject('/LE')] = ArrayObject(
+                            [NameObject(_LINE_ENDS[e]) for e in line_ends])
                 if subtype == 'Polygon':     # revision cloud — record vertices
                     gx1, gy1, gx2, gy2 = geom
                     annot[NameObject('/Vertices')] = ArrayObject([FloatObject(v) for v in
                         (gx1, gy1, gx2, gy1, gx2, gy2, gx1, gy2)])
                     annot[NameObject('/IT')] = NameObject('/PolygonCloud')
+                    annot[NameObject('/BE')] = DictionaryObject({
+                        NameObject('/S'): NameObject('/C'), NameObject('/I'): NumberObject(1)})
                 ap_rect = _generate_shape_ap(annot, subtype, geom, style, writer)
                 annot[NameObject('/Rect')] = ArrayObject(
                     [FloatObject(v) for v in ap_rect])
@@ -3697,6 +4582,33 @@ def register_viewer_routes(app, sessions, inject_token=None):
                 # (the /Rect above is padded for the stroke/bumps).
                 if subtype in ('Square', 'Circle', 'Polygon'):
                     annot[NameObject('/PWRect')] = _carr(geom)
+
+            elif subtype in _TEXT_MARKUP and data.get('quads'):
+                # From a text selection: one quad per line (display frame in,
+                # raw out — see _display_quads_to_raw).
+                quads = _display_quads_to_raw(data.get('quads') or [], rotate,
+                                              raw_W, raw_H, off_x, off_y)
+                if not quads:
+                    return jsonify({'error': 'No text to mark up',
+                                    'error_key': 'err.no_text_to_mark_up'}), 400
+                mk_color = (_norm_rgb(data.get('border_color'))
+                            or _TEXT_MARKUP_DEFAULT_RGB[subtype])
+                annot = DictionaryObject({
+                    NameObject('/Type'):       NameObject('/Annot'),
+                    NameObject('/Subtype'):    NameObject('/' + subtype),
+                    NameObject('/QuadPoints'): _carr([v for q in quads for v in q]),
+                    NameObject('/C'):          _carr(mk_color),
+                    NameObject('/F'):          NumberObject(4),
+                    NameObject('/PWKind'):     NameObject('/TextMarkup'),
+                })
+                if subtype == 'Highlight':
+                    annot[NameObject('/CA')] = FloatObject(1.0)
+                # The marked-up words, as Acrobat's "copy selected text into
+                # the comment" does — the Comments list then says what was marked.
+                if text:
+                    annot[NameObject('/Contents')] = _TS2(text[:20000])
+                annot[NameObject('/Rect')] = _carr(
+                    _generate_text_markup_ap(annot, subtype, quads, mk_color, writer))
 
             elif subtype == 'Highlight':
                 rv = [float(v) for v in rect]
@@ -3743,6 +4655,41 @@ def register_viewer_routes(app, sessions, inject_token=None):
                                                      rv[2] - rv[0], rv[3] - rv[1]])
                 annot[NameObject('/AP')] = writer._add_object(
                     DictionaryObject({NameObject('/N'): writer._add_object(_xo)}))
+            elif subtype == 'Stamp' and isinstance(data.get('stamp'), dict):
+                st_in = data.get('stamp') or {}
+                label = ' '.join(str(st_in.get('label', '') or '').split())[:_STAMP_LABEL_MAX]
+                sub = ' '.join(str(st_in.get('sub', '') or '').split())[:_STAMP_SUB_MAX]
+                key = _re.sub(r'[^a-z_]', '', str(st_in.get('key', '') or 'custom'))[:32] or 'custom'
+                if not label:
+                    return jsonify({'error': 'Stamp has no text',
+                                    'error_key': 'err.stamp_has_no_text'}), 400
+                col = _norm_rgb(st_in.get('color'), [0.12, 0.55, 0.23])
+                rv = [float(v) for v in rect]
+                rx1, ry1 = min(rv[0], rv[2]), min(rv[1], rv[3])
+                rx2, ry2 = max(rv[0], rv[2]), max(rv[1], rv[3])
+                if rx2 - rx1 < 4 or ry2 - ry1 < 4:
+                    return jsonify({'error': 'Stamp too small'}), 400
+                annot = DictionaryObject({
+                    NameObject('/Type'):    NameObject('/Annot'),
+                    NameObject('/Subtype'): NameObject('/Stamp'),
+                    NameObject('/Rect'):    _carr([rx1, ry1, rx2, ry2]),
+                    NameObject('/F'):       NumberObject(4),
+                    NameObject('/C'):       _carr(col),
+                    NameObject('/Name'):    NameObject(_STAMP_STD_NAMES.get(key, '/PW' + ''.join(
+                                                p.capitalize() for p in key.split('_')))),
+                    NameObject('/Contents'): _TS2(label + (' - ' + sub if sub else '')),
+                    NameObject('/PWKind'):  NameObject('/RubberStamp'),
+                    NameObject('/PWStampKey'):   _TS2(key),
+                    NameObject('/PWStampLabel'): _TS2(label),
+                    NameObject('/PWStampSub'):   _TS2(sub),
+                })
+                ap_matrix = _ap_upright_matrix(rotate) if rotate and disp_rect else None
+                if ap_matrix:
+                    fw = abs(disp_rect[2] - disp_rect[0]); fh = abs(disp_rect[3] - disp_rect[1])
+                else:
+                    fw, fh = rx2 - rx1, ry2 - ry1
+                _generate_review_stamp_ap(annot, label, sub, col, fw, fh, writer, ap_matrix)
+
             elif subtype == 'Stamp':                # imported image
                 from pypdf.generic import DecodedStreamObject as _DSO2
                 img_data = str(data.get('image', '') or '')
@@ -4018,6 +4965,88 @@ def register_viewer_routes(app, sessions, inject_token=None):
             for p in sorted(_thread_positions(annots, annot_idx) + [annot_idx],
                             reverse=True):
                 del annots[p]
+
+            out = io.BytesIO()
+            writer.write(out)
+            page_rec['pdf_bytes'] = out.getvalue()
+            thumb = _render_thumb_b64(page_rec['pdf_bytes'])
+            if thumb:
+                page_rec['thumbnail'] = thumb
+            _recovery.mark_dirty(session, page_id)
+            u, r = _annot_counts(session)
+            return jsonify({
+                'annotations': _get_annotations(page_rec['pdf_bytes']),
+                'editable':    _get_editable_annotations(page_rec['pdf_bytes']),
+                'thumbnail':   thumb,
+                'undo_count':  u,
+                'redo_count':  r,
+            })
+        except Exception as exc:
+            import traceback; traceback.print_exc()
+            return jsonify({'error': str(exc)}), 500
+
+    @app.route('/api/viewer/restyle_text_markup', methods=['POST'])
+    @_serialised_on_session
+    def viewer_restyle_text_markup():
+        """Recolour a text-markup annotation and/or change its kind (Highlight /
+        Underline / StrikeOut / Squiggly) IN PLACE — same object, same index,
+        same thread — and redraw its appearance.  One undo step."""
+        from pypdf.generic import NameObject, ArrayObject, FloatObject
+        data    = request.json or {}
+        session = sessions.get(data.get('session_id', ''))
+        if not session:
+            return jsonify({'error': 'Session not found'}), 404
+        page_id = data.get('page_id', '')
+        try:    annot_idx = int(data.get('annot_idx', -1))
+        except Exception: annot_idx = -1
+        kind = data.get('kind')
+        if kind is not None and kind not in _TEXT_MARKUP:
+            return jsonify({'error': 'Unsupported markup kind'}), 400
+        color = data.get('color')
+        if color is not None:
+            try:
+                color = [max(0.0, min(1.0, float(c))) for c in color][:3]
+                if len(color) != 3:
+                    raise ValueError
+            except Exception:
+                return jsonify({'error': 'Bad colour'}), 400
+        pdf_bytes, page_rec = _pdf_bytes_from_session(session, page_id)
+        if not pdf_bytes:
+            return jsonify({'error': 'Page not found'}), 404
+        try:
+            reader = _pypdf.PdfReader(io.BytesIO(pdf_bytes))
+            annots = reader.pages[0].get('/Annots')
+            if hasattr(annots, 'get_object'):
+                annots = annots.get_object()
+            if not annots or annot_idx < 0 or annot_idx >= len(annots):
+                return jsonify({'error': 'Annotation not found'}), 404
+            if not _is_text_markup(annots[annot_idx].get_object()):
+                return jsonify({'error': 'Not text markup'}), 400
+        except Exception as exc:
+            return jsonify({'error': str(exc)}), 500
+
+        _annot_push_undo(session, page_id)
+        try:
+            writer = _pypdf.PdfWriter()
+            writer.append(reader)
+            annots = writer.pages[0].get('/Annots')
+            if hasattr(annots, 'get_object'):
+                annots = annots.get_object()
+            ann = annots[annot_idx].get_object()
+            cur_kind = str(ann.get('/Subtype', '')).lstrip('/')
+            new_kind = kind or cur_kind
+            # A kind change with no explicit colour takes that kind's default
+            # (a yellow strikeout reads as a highlight).
+            if color is None:
+                color = (_read_color_arr(ann.get('/C')) if new_kind == cur_kind
+                         else _TEXT_MARKUP_DEFAULT_RGB[new_kind])
+            quads = _quads_from_annot(ann)
+            ann[NameObject('/Subtype')] = NameObject('/' + new_kind)
+            ann[NameObject('/C')] = ArrayObject([FloatObject(c) for c in color])
+            ann[NameObject('/PWKind')] = NameObject('/TextMarkup')
+            ann[NameObject('/M')] = _pypdf.generic.TextStringObject(_pdf_date_now())
+            ann[NameObject('/Rect')] = ArrayObject([FloatObject(v) for v in
+                _generate_text_markup_ap(ann, new_kind, quads, color, writer)])
 
             out = io.BytesIO()
             writer.write(out)

@@ -49,7 +49,8 @@ def _font_dir():
     """Directory holding the bundled .ttf files (assets/fonts)."""
     import sys
     if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
+        from platform_io import platform_paths
+        base = platform_paths.frozen_data_dir()
     else:
         base = _APP_ROOT
     return os.path.join(base, 'assets', 'fonts')

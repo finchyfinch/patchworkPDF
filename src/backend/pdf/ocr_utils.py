@@ -833,7 +833,8 @@ _LANG_CFG_CACHE = {}
 def _bundled_tessdata_dir():
     # frozen: next to the exe; dev: <root>/src/backend/pdf/ocr_utils.py -> <root>.
     if getattr(sys, 'frozen', False):
-        base = os.path.dirname(sys.executable)
+        from platform_io import platform_paths
+        base = platform_paths.frozen_data_dir()
     else:
         base = os.path.dirname(os.path.dirname(os.path.dirname(
             os.path.dirname(os.path.abspath(__file__)))))

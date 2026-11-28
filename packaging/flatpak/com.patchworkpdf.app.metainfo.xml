@@ -48,6 +48,7 @@
        every release reports the same old version and there is then no way to
        tell two installs apart (branch is always 'master'). -->
   <releases>
+    <release version="3.5" date="2026-11-27"/>
     <release version="3.4" date="2026-11-21"/>
     <release version="3.3" date="2026-10-25"/>
     <release version="3.2" date="2026-09-30"/>

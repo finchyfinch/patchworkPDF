@@ -59,6 +59,20 @@ if [ ! -d "$APP" ]; then
   exit 1
 fi
 
+# Seal the bundle with an ad-hoc signature.  cx_Freeze leaves each Mach-O
+# individually ad-hoc signed but never signs the .app itself (no
+# Contents/_CodeSignature).  A quarantined bundle in that state (downloaded
+# via a browser) is rejected by Gatekeeper as "PatchworkPDF.app is damaged and
+# can't be opened" - with no way for the user to override it.  A valid ad-hoc
+# seal turns that into the normal "unverified developer" prompt, which the user
+# can allow via System Settings > Privacy & Security > Open Anyway.
+# This is NOT a substitute for Developer ID signing + notarization (see
+# docs/BUILD_AND_DEPLOY_MACOS.md); it only makes the unsigned build openable.
+echo "==> Ad-hoc signing the .app bundle"
+xattr -cr "$APP"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
+
 echo "==> Creating $DMG"
 mkdir -p dist
 rm -f "$DMG"

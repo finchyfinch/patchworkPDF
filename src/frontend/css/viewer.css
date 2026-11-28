@@ -1857,3 +1857,34 @@ textarea:focus-visible,
 /* v3.4: no ghost drag in the viewer rail — it does not reorder pages (Layout
    does), so the browser's own image drag only suggested a broken feature. */
 #thumb-list .thumb-item, #thumb-list .thumb-item img{-webkit-user-drag:none;user-select:none}
+
+/* Text markup pop-up (v3.5) — over a text selection or a selected markup. */
+#tm-popup{position:fixed;z-index:9400;display:none;flex-direction:column;gap:4px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;
+  padding:4px;box-shadow:0 4px 18px rgba(0,0,0,.35)}
+#tm-popup.show{display:flex}
+#tm-popup .tm-row{display:flex;align-items:center;gap:2px}
+#tm-popup:not(.editing) #tm-edit-row{display:none}
+#tm-popup .tm-btn{width:32px;height:30px;display:flex;align-items:center;justify-content:center;
+  background:none;border:1px solid transparent;border-radius:6px;color:var(--text);cursor:pointer;padding:0}
+#tm-popup .tm-btn:hover{background:var(--surface2)}
+#tm-popup .tm-btn.active{border-color:var(--accent);background:var(--surface2)}
+#tm-popup .tm-del:hover{color:var(--danger)}
+#tm-popup .tm-g{font:600 14px/1 'Syne',sans-serif}
+#tm-popup .tm-g-hl{background:#ffeb00;color:#111;padding:1px 3px;border-radius:2px}
+#tm-popup .tm-g-ul{text-decoration:underline;text-decoration-color:#0073d9;text-decoration-thickness:2px}
+#tm-popup .tm-g-so{text-decoration:line-through;text-decoration-color:#db1a1a;text-decoration-thickness:2px}
+#tm-popup .tm-g-sq{text-decoration:underline wavy;text-decoration-color:#db1a1a}
+#tm-popup .tm-sw{width:20px;height:20px;border-radius:50%;border:2px solid var(--surface);
+  box-shadow:0 0 0 1px var(--border);cursor:pointer;margin:0 3px;padding:0}
+#tm-popup .tm-sw:hover{box-shadow:0 0 0 2px var(--accent)}
+#tm-popup .tm-sep{width:1px;height:20px;background:var(--border);margin:0 4px}
+.tm-ring{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-dasharray:4 2;pointer-events:none}
+
+/* Review stamp presets (v3.5) */
+.at-stamp-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin:2px 0 8px}
+.at-stamp-opt{font:700 10.5px/1.15 'Syne',sans-serif;text-transform:uppercase;letter-spacing:.02em;
+  background:var(--bg);border:1.5px solid currentColor;border-radius:5px;padding:5px 4px;cursor:pointer;
+  opacity:.72;white-space:normal;overflow-wrap:anywhere;hyphens:auto}
+.at-stamp-opt:hover{opacity:1}
+.at-stamp-opt.active{opacity:1;box-shadow:0 0 0 2px var(--accent)}
